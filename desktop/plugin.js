@@ -59,10 +59,15 @@ const ROUTE = '/project-command-center'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
+// The session kanban is a third page, not a tab on the board: it reads the same
+// links but spans every project, which the board's per-project columns cannot.
+const SESSIONS_ROUTE = `${ROUTE}/sessions`
 const QUERY_ROOT = 'project-command-center'
 const TREE_MS = 15000
 const LIVE_MS = 5000
 const STATUS_KEY = 'projectStatus.v1'
+// Lane labels and order for the session kanban, kept apart from the store's ids.
+const LANES_KEY = 'sessionLanes.v1'
 const SORT_KEY = 'projectSort.v1'
 const OPEN_KEY = 'openProject.v1'
 const BOARD_CARD_LIMIT = 5
@@ -234,6 +239,166 @@ function sessionLaneSummary(sessionCount, counts, projectLane) {
 }
 // session-lane:end
 
+// session-kanban:begin
+// The session kanban's pure half: the lane defaults and their stored shape, the
+// filter rule, the column counts, the table order and the move body. No imports,
+// no JSX and no storage here, so the node suite can slice this block out of the
+// live file and run it. `kanbanLaneFor` defers to resolveSessionLane above, so
+// the plugin keeps one resolution order rather than a second one for this page;
+// the suite loads the session-lane block first.
+
+const KANBAN_LANES = [
+  { id: 'backlog', label: 'Backlog', order: 0 },
+  { id: 'active', label: 'Active', order: 1 },
+  { id: 'review', label: 'Review', order: 2 },
+  { id: 'blocked', label: 'Blocked', order: 3 },
+  { id: 'done', label: 'Done', order: 4 }
+]
+const KANBAN_LANE_IDS = KANBAN_LANES.map(lane => lane.id)
+// A card untouched for three days is stale, unless it already landed in done.
+const KANBAN_STALE_MS = 3 * 24 * 60 * 60 * 1000
+// The four words a card's provenance dot can show. A session with no lane of its
+// own reads as unset even when the project lane carries the card, because the dot
+// answers "who set this lane", not "which lane is this in".
+const KANBAN_SOURCE_TEXT = {
+  user: 'you',
+  agent: 'agent',
+  auto: 'agent',
+  pr: 'from PR',
+  project: 'unset',
+  unset: 'unset'
+}
+
+function kanbanLane(id) {
+  const value = typeof id === 'string' ? id.trim().toLowerCase() : ''
+
+  return KANBAN_LANE_IDS.includes(value) ? value : ''
+}
+
+// Storage is the only lane shape we do not control. Unknown ids are dropped,
+// missing labels take the default, duplicate or absent orders are renumbered by
+// the default order, and any input that is not a list falls back to the default
+// list, so a malformed write can never leave the board without its five lanes.
+function normalizeKanbanLanes(raw) {
+  const rows = Array.isArray(raw) ? raw : []
+  const out = []
+
+  for (const lane of KANBAN_LANES) {
+    const row = rows.find(item => item && item.id === lane.id) || {}
+    const label = typeof row.label === 'string' ? row.label.trim() : ''
+    const order = Number(row.order)
+
+    out.push({ id: lane.id, label: label || lane.label, order: Number.isFinite(order) ? order : lane.order })
+  }
+
+  // A stored order is only trusted when it is a permutation of 0..4. Duplicates
+  // (a hand edit, a half-written row) would otherwise slide one lane across the
+  // board, so that case keeps the default order and the stored labels.
+  const orders = out.map(row => row.order)
+  const valid =
+    orders.every(order => Number.isInteger(order) && order >= 0 && order < KANBAN_LANES.length) &&
+    new Set(orders).size === orders.length
+
+  if (!valid) out.forEach(row => (row.order = KANBAN_LANE_IDS.indexOf(row.id)))
+
+  out.sort((a, b) => a.order - b.order)
+
+  return out.map((row, index) => ({ id: row.id, label: row.label, order: index }))
+}
+
+// A rename keeps the lane where it is; an empty label keeps the old one.
+function renameKanbanLane(lanes, id, label) {
+  const text = typeof label === 'string' ? label.trim() : ''
+  const lane = kanbanLane(id)
+
+  if (!lane) return normalizeKanbanLanes(lanes)
+
+  return normalizeKanbanLanes(lanes).map(row => (row.id === lane && text ? { ...row, label: text } : row))
+}
+
+// One step up (delta < 0) or down; a move past either end is a no-op.
+function moveKanbanLane(lanes, id, delta) {
+  const list = normalizeKanbanLanes(lanes)
+  const lane = kanbanLane(id)
+  const from = list.findIndex(row => row.id === lane)
+  const step = Number(delta) < 0 ? -1 : 1
+  const to = from + step
+
+  if (from < 0 || to < 0 || to >= list.length) return list
+  const next = list.slice()
+
+  next.splice(to, 0, next.splice(from, 1)[0])
+
+  return next.map((row, index) => ({ ...row, order: index }))
+}
+
+// The page's one lane lookup. A card with nothing set anywhere still has to sit
+// in a column, so it lands in backlog and reads as unset.
+function kanbanLaneFor(link, pr, projectLane) {
+  return resolveSessionLane(link, pr, projectLane) || { lane: 'backlog', note: '', source: 'unset' }
+}
+
+// Filters compose: project, source, stale and search all have to pass. Search is
+// case-insensitive substring over the title, project label, branch and both
+// reference numbers, which is what a card shows.
+function kanbanFilterCards(cards, filters) {
+  const f = filters || {}
+  const q = String(f.search || '').trim().toLowerCase()
+  const source = f.source === 'user' || f.source === 'agent' ? f.source : ''
+
+  return (cards || []).filter(card => {
+    if (!card) return false
+    if (f.projectId && card.projectId !== f.projectId) return false
+    if (source === 'user' && card.source !== 'user') return false
+    if (source === 'agent' && card.source !== 'agent' && card.source !== 'auto') return false
+    if (f.staleOnly && !card.stale) return false
+    if (!q) return true
+    const hay = [
+      card.title,
+      card.projectLabel,
+      card.branch,
+      card.issue ? `#${card.issue}` : '',
+      card.pr ? `#${card.pr}` : '',
+      card.issue,
+      card.pr
+    ]
+
+    return hay.some(value => value != null && String(value).toLowerCase().includes(q))
+  })
+}
+
+// Column counts come from the filtered list, so a chip and the cards under it
+// never disagree.
+function kanbanCounts(cards, lanes) {
+  const counts = {}
+
+  for (const lane of normalizeKanbanLanes(lanes)) counts[lane.id] = 0
+  for (const card of cards || []) if (card && counts[card.lane] != null) counts[card.lane] += 1
+
+  return counts
+}
+
+// The table is grouped by the user's lane order, newest first inside a lane.
+function sortKanbanCards(cards, lanes, direction) {
+  const rank = new Map(normalizeKanbanLanes(lanes).map((row, index) => [row.id, index]))
+  const dir = Number(direction) < 0 ? -1 : 1
+
+  return (cards || []).slice().sort((a, b) => {
+    const byLane = (rank.get(a && a.lane) ?? 99) - (rank.get(b && b.lane) ?? 99)
+
+    if (byLane !== 0) return byLane * dir
+
+    return (Number(b && b.lastActivity) || 0) - (Number(a && a.lastActivity) || 0)
+  })
+}
+
+// The one write a move makes. Scope is explicit: without it the store would move
+// the project's lane instead of this session's card.
+function kanbanMoveBody(projectId, sessionId, status) {
+  return { project_id: projectId, session_id: sessionId, status, scope: 'session' }
+}
+// session-kanban:end
+
 const LIVE_LABELS = {
   idle: 'Idle',
   starting: 'Starting',
@@ -340,6 +505,13 @@ const $statuses = atom({})
 const $boardLive = atom(false)
 // project id → { at, status } for the last status this client posted.
 const statusPostedAt = new Map()
+// The session kanban's editable lane table, and the moves this client posted.
+const $lanes = atom(KANBAN_LANES)
+// session id → { project_id, status, at } for a session lane posted just now.
+const $sessionStatus = atom({})
+// A board poll that started before a move landed still carries the old lane, so
+// an override outlives the POST for one bounded window and dies on its echo.
+const SESSION_POST_TTL_MS = 30000
 
 function readStatuses() {
   const raw = pluginCtx ? pluginCtx.storage.get(STATUS_KEY, {}) : {}
@@ -388,6 +560,85 @@ function writeStatus(projectId, status) {
   // copy above already carries the change, so the picker never blocks on it.
   statusPostedAt.set(projectId, { at: Date.now(), status })
   boardRest('/board/status', { method: 'POST', body: { project_id: projectId, status } }).catch(() => {})
+}
+
+// Lane labels and order belong to the user, but the ids belong to the store, so
+// the read path never trusts storage: a missing key or a hand-edited value comes
+// back as the constant default.
+function readLanes() {
+  const raw = pluginCtx ? pluginCtx.storage.get(LANES_KEY, null) : null
+
+  return normalizeKanbanLanes(raw)
+}
+
+function saveLanes(next) {
+  if (!pluginDisposed && pluginCtx) pluginCtx.storage.set(LANES_KEY, next)
+}
+
+function writeLanes(next) {
+  const rows = normalizeKanbanLanes(next)
+
+  $lanes.set(rows)
+  saveLanes(rows)
+}
+
+// A card moves before the POST is answered; a refusal puts it back and says why.
+// The board read is invalidated either way, so the server copy wins as soon as
+// it lands.
+function writeSessionLane(projectId, sessionId, status) {
+  const lane = kanbanLane(status)
+
+  if (!projectId || !sessionId || !lane) return
+  const at = Date.now()
+
+  $sessionStatus.set({ ...$sessionStatus.get(), [sessionId]: { project_id: projectId, status: lane, at } })
+  boardRest('/board/status', { method: 'POST', body: kanbanMoveBody(projectId, sessionId, lane) })
+    .then(res => {
+      if (res && res.ok === false) throw new Error(String(res.error || 'The board refused the move.'))
+      queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
+    })
+    .catch(err => {
+      const current = $sessionStatus.get()
+
+      if (current[sessionId] && current[sessionId].at === at) {
+        const back = { ...current }
+
+        delete back[sessionId]
+        $sessionStatus.set(back)
+      }
+
+      // Resync either way: a refusal means this client's copy is the one that
+      // was wrong, and the poll is the cheapest way back to the store's answer.
+      queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
+      host.notify({
+        kind: 'warning',
+        message: `Could not move this session to ${SESSION_LANE_LABELS[lane]}: ${(err && err.message) || 'the board did not answer'}`
+      })
+    })
+}
+
+// The board wins once it echoes the move, or after the grace window; without this
+// an override would outlive the poll that already carries the answer.
+function reconcileSessionLanes(links) {
+  const rows = $sessionStatus.get()
+  const ids = Object.keys(rows)
+
+  if (ids.length === 0) return
+  const byId = new Map((links || []).filter(Boolean).map(link => [link.session_id, link]))
+  const now = Date.now()
+  const next = { ...rows }
+  let changed = false
+
+  for (const id of ids) {
+    const link = byId.get(id)
+
+    if ((link && link.status === rows[id].status) || now - rows[id].at >= SESSION_POST_TTL_MS) {
+      delete next[id]
+      changed = true
+    }
+  }
+
+  if (changed) $sessionStatus.set(next)
 }
 
 // A payload that is not the board shape (a 404 body, an older process) yields
@@ -928,6 +1179,16 @@ const CSS_TEXT = `
 .pcc-graph-row:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -2px; }
 .pcc-graph-scroll { scrollbar-width: thin; }
 .pcc-diff-scroll { scrollbar-width: thin; }
+.pcc-kcard { transition: background-color 120ms ease, border-color 120ms ease, opacity 120ms ease; }
+.pcc-kcard:hover, .pcc-kcard:focus-visible { background: var(--chrome-action-hover); border-color: var(--ui-stroke-secondary); outline: none; }
+.pcc-kcard[data-dragging="true"] { opacity: 0.5; }
+.pcc-kcol[data-drop="true"] { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 6%, transparent); }
+.pcc-kempty { border: 1px dashed color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); border-radius: 8px; padding: 10px; font-size: 0.6875rem; color: var(--ui-text-quaternary); text-align: center; }
+.pcc-ktable th { text-align: left; font-weight: 500; font-size: 0.6875rem; color: var(--ui-text-quaternary); padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); position: sticky; top: 0; background: var(--ui-bg-elevated); }
+.pcc-ktable td { padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 28%, transparent); vertical-align: middle; }
+.pcc-ktable tbody tr:hover { background: color-mix(in srgb, var(--chrome-action-hover) 70%, transparent); }
+.pcc-ksort { border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; padding: 0; }
+.pcc-ksort:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 2px; border-radius: 3px; }
 `
 
 const S = {
@@ -1862,7 +2123,103 @@ const S = {
     fontVariantNumeric: 'tabular-nums',
     userSelect: 'none'
   },
-  diffText: { paddingRight: 12, paddingLeft: 8 }
+  diffText: { paddingRight: 12, paddingLeft: 8 },
+  // ── session kanban ─────────────────────────────────────────────────────
+  filters: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 20px 10px', flex: 'none', flexWrap: 'wrap' },
+  select: {
+    height: 28,
+    padding: '0 8px',
+    borderRadius: 8,
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
+    background: 'color-mix(in srgb, var(--ui-bg-elevated) 80%, transparent)',
+    color: 'var(--ui-text-secondary)',
+    fontSize: '0.75rem',
+    maxWidth: 220
+  },
+  kcolBody: {
+    flex: '1 1 0',
+    minHeight: 0,
+    overflowY: 'auto',
+    padding: '8px 10px 12px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+    borderRadius: '0 0 12px 12px'
+  },
+  kcard: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    padding: '8px 10px',
+    borderRadius: 8,
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 55%, transparent)',
+    background: 'transparent',
+    color: 'var(--ui-text-primary)',
+    minWidth: 0,
+    cursor: 'grab'
+  },
+  kcardHead: { display: 'flex', alignItems: 'flex-start', gap: 6, minWidth: 0 },
+  kcardTitle: {
+    flex: '1 1 0',
+    fontSize: '0.75rem',
+    lineHeight: 1.35,
+    fontWeight: 500,
+    display: '-webkit-box',
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: 'vertical',
+    overflow: 'hidden',
+    wordBreak: 'break-word',
+    minWidth: 0
+  },
+  kdot: { width: 7, height: 7, borderRadius: 999, flex: 'none', marginTop: 5 },
+  kcardMeta: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-quaternary)',
+    minWidth: 0
+  },
+  kmenuBtn: {
+    border: 0,
+    background: 'transparent',
+    color: 'var(--ui-text-quaternary)',
+    cursor: 'pointer',
+    borderRadius: 4,
+    padding: 2,
+    display: 'inline-flex',
+    flex: 'none'
+  },
+  kmenuHead: { padding: '4px 8px', fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
+  kmenuNote: { padding: '4px 8px', fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)', maxWidth: 240, lineHeight: 1.4 },
+  notice: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    margin: '0 20px 10px',
+    padding: '6px 10px',
+    borderRadius: 8,
+    fontSize: '0.75rem',
+    color: 'var(--ui-text-secondary)',
+    background: 'color-mix(in srgb, var(--ui-purple) 10%, transparent)',
+    border: '1px solid color-mix(in srgb, var(--ui-purple) 35%, transparent)'
+  },
+  lanesPop: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 250 },
+  laneRow: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+  laneInput: {
+    flex: '1 1 0',
+    minWidth: 0,
+    height: 26,
+    padding: '0 7px',
+    borderRadius: 6,
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
+    background: 'transparent',
+    color: 'var(--ui-text-primary)',
+    fontSize: '0.75rem'
+  },
+  ktableWrap: { flex: '1 1 0', minHeight: 0, overflow: 'auto', margin: '0 20px 12px', border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 55%, transparent)', borderRadius: 10 },
+  ktable: { borderCollapse: 'collapse', width: '100%', fontSize: '0.75rem', color: 'var(--ui-text-secondary)' }
 }
 
 // ── small pieces ─────────────────────────────────────────────────────────────
@@ -7380,6 +7737,890 @@ function ProjectsPage() {
   })
 }
 
+// ── session kanban ───────────────────────────────────────────────────────────
+// One page over every project's sessions: the board's link rows joined to the
+// gateway's session list, with the store's lane ids as columns. Lane labels and
+// order are the user's (see $lanes); the ids never change, because every write
+// names one of the five and the backend validates it.
+
+const EMPTY_BRANCHES = {}
+const KANBAN_VIEWS = [
+  { id: 'kanban', label: 'Kanban' },
+  { id: 'table', label: 'Table' }
+]
+const KANBAN_SOURCE_FILTERS = [
+  { value: '', label: 'Any source' },
+  { value: 'user', label: 'Set by you' },
+  { value: 'agent', label: 'Set by agent' }
+]
+
+// Branches are read the way the project detail header reads them: one /repo call
+// per folder, batched into a single query so N projects share one cache entry
+// and a folder with no answer simply falls back to `main` on the card.
+function useProjectBranches(projects) {
+  const folders = useMemo(() => {
+    const seen = new Set()
+
+    for (const project of projects || []) {
+      const folder = primaryPath(project)
+
+      if (folder) seen.add(folder)
+      if (seen.size >= COUNTS_PATH_LIMIT) break
+    }
+
+    return Array.from(seen)
+  }, [projects])
+
+  const key = folders.join('\n')
+  const query = useQuery({
+    enabled: folders.length > 0,
+    queryFn: () =>
+      Promise.all(
+        folders.map(folder =>
+          ghRest(`/repo?path=${encodeURIComponent(folder)}`)
+            .then(res => [folder, res && res.ok !== false && !res.detached ? String(res.branch || '') : ''])
+            .catch(() => [folder, ''])
+        )
+      ).then(rows => Object.fromEntries(rows)),
+    queryKey: [QUERY_ROOT, 'repo-branches', key],
+    refetchInterval: 60000,
+    retry: false,
+    staleTime: 30000
+  })
+
+  return query.data && typeof query.data === 'object' ? query.data : EMPTY_BRANCHES
+}
+
+// The card the filters, the columns and the table all read. Every field is a
+// plain value so the page never reaches back into three different payloads while
+// rendering one row.
+function buildKanbanCard(input) {
+  const source = input || {}
+  const session = source.session || {}
+  const link = source.link || null
+  const project = source.project || null
+  const projectId = String((link && link.project_id) || '')
+  const rawIssue = Number(link && link.issue)
+  const rawPr = Number(link && link.pr)
+  const lane = kanbanLaneFor(link, source.pr || null, source.projectLane)
+  const started = stampMs(session.started_at)
+  const updated = stampMs(link && link.status_updated_at)
+  const lastActivity = Math.max(started, updated)
+  const now = Number(source.now) || Date.now()
+  const title =
+    String(session.title || '').trim() ||
+    String((link && link.title) || '').trim() ||
+    String(session.preview || '').trim() ||
+    'Untitled session'
+
+  return {
+    id: String(session.id || (link && link.session_id) || ''),
+    sessionId: String(session.id || ''),
+    title,
+    projectId,
+    projectLabel: projectId ? String((project && project.label) || projectId) : 'No project',
+    branch: String(source.branch || '').trim() || 'main',
+    issue: Number.isFinite(rawIssue) && rawIssue > 0 ? rawIssue : 0,
+    pr: Number.isFinite(rawPr) && rawPr > 0 ? rawPr : 0,
+    prState: source.pr || null,
+    lane: lane.lane,
+    laneSource: lane.source,
+    laneNote: lane.note || '',
+    lastActivity,
+    stale: lane.lane !== 'done' && lastActivity > 0 && now - lastActivity > KANBAN_STALE_MS,
+    linked: Boolean(link)
+  }
+}
+
+function KanbanSelect({ ariaLabel, disabled, onChange, options, style, value }) {
+  return jsx('select', {
+    'aria-label': ariaLabel,
+    disabled: Boolean(disabled),
+    onChange: event => onChange(event.target.value),
+    style: { ...S.select, ...style, ...(disabled ? { opacity: 0.55, cursor: 'not-allowed' } : null) },
+    value,
+    children: options.map(option => jsx('option', { value: option.value, children: option.label }, option.value))
+  })
+}
+
+function LaneEditorRow({ index, lanes, lane, total }) {
+  const [draft, setDraft] = useState(lane.label)
+
+  useEffect(() => setDraft(lane.label), [lane.label])
+
+  const commit = () => {
+    if (draft.trim() && draft.trim() !== lane.label) writeLanes(renameKanbanLane(lanes, lane.id, draft))
+    else if (!draft.trim()) setDraft(lane.label)
+  }
+
+  return jsxs('div', {
+    style: S.laneRow,
+    children: [
+      jsx('span', { 'aria-hidden': 'true', style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] } }),
+      jsx('input', {
+        'aria-label': `${lane.label} lane label`,
+        onBlur: commit,
+        onChange: event => setDraft(event.target.value),
+        onKeyDown: event => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            commit()
+            event.currentTarget.blur()
+          }
+          if (event.key === 'Escape') {
+            setDraft(lane.label)
+            event.currentTarget.blur()
+          }
+        },
+        style: S.laneInput,
+        value: draft
+      }),
+      jsx(Tip, {
+        label: `Move ${lane.label} up`,
+        children: jsx(Button, {
+          'aria-label': `Move ${lane.label} lane up`,
+          disabled: index === 0,
+          onClick: () => writeLanes(moveKanbanLane(lanes, lane.id, -1)),
+          size: 'icon-xs',
+          variant: 'ghost',
+          children: jsx(Codicon, { name: 'arrow-up', size: '0.75rem' })
+        })
+      }),
+      jsx(Tip, {
+        label: `Move ${lane.label} down`,
+        children: jsx(Button, {
+          'aria-label': `Move ${lane.label} lane down`,
+          disabled: index === total - 1,
+          onClick: () => writeLanes(moveKanbanLane(lanes, lane.id, 1)),
+          size: 'icon-xs',
+          variant: 'ghost',
+          children: jsx(Codicon, { name: 'arrow-down', size: '0.75rem' })
+        })
+      })
+    ]
+  })
+}
+
+// Labels and order only; adding or removing a lane would change the store's five
+// ids, which this phase does not do.
+function LanesPopover({ lanes }) {
+  const rows = normalizeKanbanLanes(lanes)
+
+  return jsxs(Popover, {
+    children: [
+      jsx(PopoverTrigger, {
+        asChild: true,
+        children: jsxs(Button, {
+          'aria-label': 'Edit lane labels and order',
+          size: 'sm',
+          variant: 'outline',
+          children: [jsx(Codicon, { name: 'settings-gear', size: '0.875rem' }), 'Lanes']
+        })
+      }),
+      jsx(PopoverContent, {
+        align: 'end',
+        children: jsxs('div', {
+          style: S.lanesPop,
+          children: [
+            jsx('div', { style: S.kmenuHead, children: 'Rename or reorder a lane' }),
+            ...rows.map((lane, index) => jsx(LaneEditorRow, { index, lane, lanes: rows, total: rows.length }, lane.id))
+          ]
+        })
+      })
+    ]
+  })
+}
+
+function KanbanProvenance({ card }) {
+  const text = KANBAN_SOURCE_TEXT[card.laneSource] || 'unset'
+  const label = text === 'unset' ? 'Lane unset' : `Lane from ${text}`
+  const title = card.laneNote ? `${label}: ${card.laneNote}` : label
+
+  return jsx(Tip, {
+    label: title,
+    children: jsx('span', {
+      'aria-label': title,
+      style: { ...S.kdot, background: SESSION_LANE_VARS[card.lane] || 'var(--ui-text-quaternary)' }
+    })
+  })
+}
+
+function KanbanRefChip({ card }) {
+  const chips = []
+
+  if (card.issue) {
+    chips.push(
+      jsx(
+        Tip,
+        {
+          label: `Issue #${card.issue}`,
+          children: jsxs('span', {
+            style: S.chip,
+            children: [jsx(Codicon, { name: 'issues', size: '0.625rem', style: { flex: 'none' } }), `#${card.issue}`]
+          })
+        },
+        'issue'
+      )
+    )
+  }
+
+  if (card.pr) {
+    const look = ghStatusLook('pr', card.prState || {})
+
+    chips.push(
+      jsx(
+        Tip,
+        {
+          label: `Pull request #${card.pr}${look.label ? `, ${look.label}` : ''}`,
+          children: jsxs('span', {
+            style: { ...S.chip, color: look.color },
+            children: [
+              jsx(Codicon, { name: look.name, size: '0.625rem', style: { flex: 'none', color: look.color } }),
+              `#${card.pr}`
+            ]
+          })
+        },
+        'pr'
+      )
+    )
+  }
+
+  return chips.length ? jsx('span', { style: { display: 'inline-flex', gap: 4, flexWrap: 'wrap' }, children: chips }) : null
+}
+
+function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
+  const canMove = Boolean(card.projectId && card.sessionId)
+  const sessionItem = jsx(
+    DropdownMenuItem,
+    {
+      onSelect: () => onOpenSession(card.sessionId),
+      children: [jsx(Codicon, { name: 'comment-discussion', size: '0.75rem' }, 'icon'), 'Open session']
+    },
+    'session'
+  )
+
+  return jsxs(DropdownMenu, {
+    children: [
+      jsx(DropdownMenuTrigger, {
+        asChild: true,
+        children: jsx('button', {
+          'aria-label': `Actions for ${card.title}`,
+          className: 'pcc-more',
+          onClick: event => event.stopPropagation(),
+          style: S.kmenuBtn,
+          type: 'button',
+          children: jsx(Codicon, { name: 'ellipsis', size: '0.875rem' })
+        })
+      }),
+      jsx(DropdownMenuContent, {
+        align: 'end',
+        children: canMove
+          ? [
+              jsx('div', { style: S.kmenuHead, children: 'Move to' }, 'move-head'),
+              ...lanes.map(lane =>
+                jsxs(
+                  DropdownMenuItem,
+                  {
+                    onSelect: () => onMove(card, lane.id),
+                    children: [
+                      jsx(
+                        Codicon,
+                        {
+                          name: 'check',
+                          size: '0.75rem',
+                          style: { visibility: lane.id === card.lane ? 'visible' : 'hidden' }
+                        },
+                        'check'
+                      ),
+                      jsx(
+                        'span',
+                        {
+                          style: { display: 'inline-flex', alignItems: 'center', gap: 6 },
+                          children: [
+                            jsx('span', {
+                              'aria-hidden': 'true',
+                              style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] }
+                            }),
+                            lane.label
+                          ]
+                        },
+                        'label'
+                      )
+                    ]
+                  },
+                  lane.id
+                )
+              ),
+              jsx(Separator, {}, 'sep'),
+              sessionItem,
+              jsx(
+                DropdownMenuItem,
+                {
+                  onSelect: () => onOpenProject(card.projectId),
+                  children: [jsx(Codicon, { name: 'project', size: '0.75rem' }), 'Open project']
+                },
+                'project'
+              )
+            ]
+          : [
+              jsx(
+                'div',
+                { style: S.kmenuNote, children: 'No project is linked to this session, so it cannot be moved.' },
+                'why'
+              ),
+              sessionItem
+            ]
+      })
+    ]
+  })
+}
+
+function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpenProject, onOpenSession, state }) {
+  return jsxs('div', {
+    'aria-label': `${card.title}. ${SESSION_LANE_LABELS[card.lane] || ''} lane.`,
+    className: 'pcc-kcard',
+    'data-dragging': dragId === card.id ? 'true' : 'false',
+    draggable: true,
+    onClick: () => onOpenSession(card.sessionId),
+    onDragEnd,
+    onDragStart: event => {
+      event.dataTransfer.setData('text/plain', card.id)
+      event.dataTransfer.effectAllowed = 'move'
+      onDragStart(card)
+    },
+    onKeyDown: event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        onOpenSession(card.sessionId)
+      }
+    },
+    role: 'button',
+    style: S.kcard,
+    tabIndex: 0,
+    children: [
+      jsxs('div', {
+        style: S.kcardHead,
+        children: [
+          jsx('span', { style: S.kcardTitle, children: card.title }, 'title'),
+          state && state !== 'idle' ? jsx(LiveDot, { state }, 'live') : null,
+          jsx(KanbanProvenance, { card }, 'provenance'),
+          jsx(KanbanCardMenu, { card, lanes, onMove, onOpenProject, onOpenSession }, 'menu')
+        ]
+      }),
+      jsxs('div', {
+        style: S.kcardMeta,
+        children: [
+          jsx('span', { style: S.ellipsis, children: card.projectLabel }, 'project'),
+          jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }, 'branch'),
+          jsx(KanbanRefChip, { card }, 'refs'),
+          card.linked
+            ? null
+            : jsx('span', { style: { ...S.chip, color: 'var(--ui-text-quaternary)' }, children: 'Unlinked' }, 'unlinked'),
+          card.lastActivity
+            ? jsx(
+                Tip,
+                {
+                  label: stampTip(card.lastActivity),
+                  children: jsx('span', { children: ageText(card.lastActivity) })
+                },
+                'age'
+              )
+            : null
+        ]
+      })
+    ]
+  })
+}
+
+function KanbanColumn({ cards, count, dropLane, dragId, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, states }) {
+  const over = dropLane === lane.id
+
+  return jsxs('div', {
+    className: 'pcc-kcol',
+    'data-drop': over ? 'true' : 'false',
+    style: S.column,
+    children: [
+      jsx('div', {
+        style: S.colHeader,
+        children: jsxs('div', {
+          style: S.row,
+          children: [
+            jsx('span', {
+              'aria-hidden': 'true',
+              style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] }
+            }),
+            jsx('span', {
+              style: { fontSize: '0.8125rem', fontWeight: 500, color: 'var(--ui-text-secondary)' },
+              children: lane.label
+            }),
+            jsx('span', { style: { ...S.count, marginLeft: 'auto' }, children: count })
+          ]
+        })
+      }),
+      jsxs('div', {
+        onDragLeave: event => {
+          if (!event.currentTarget.contains(event.relatedTarget)) onDragOver('')
+        },
+        onDragOver: event => {
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'move'
+          if (!over) onDragOver(lane.id)
+        },
+        onDrop: event => {
+          event.preventDefault()
+          onDrop(lane.id)
+        },
+        style: S.kcolBody,
+        children: cards.length
+          ? cards.map(card =>
+              jsx(
+                KanbanCard,
+                {
+                  card,
+                  dragId,
+                  lanes,
+                  onDragEnd,
+                  onDragStart,
+                  onMove,
+                  onOpenProject,
+                  onOpenSession,
+                  state: states.get(card.sessionId)
+                },
+                card.id
+              )
+            )
+          : jsx('div', { className: 'pcc-kempty', children: 'No sessions' })
+      })
+    ]
+  })
+}
+
+function KanbanTable({ cards, direction, lanes, onMove, onOpenProject, onOpenSession, onSortLane }) {
+  const rows = sortKanbanCards(cards, lanes, direction)
+
+  return jsx('div', {
+    style: S.ktableWrap,
+    children: jsxs('table', {
+      className: 'pcc-ktable',
+      style: S.ktable,
+      children: [
+        jsx('thead', {
+          children: jsx('tr', {
+            children: [
+              jsx('th', { children: 'Session' }, 'session'),
+              jsx('th', { children: 'Project' }, 'project'),
+              jsx(
+                'th',
+                {
+                  children: jsx('button', {
+                    className: 'pcc-ksort',
+                    onClick: onSortLane,
+                    type: 'button',
+                    children: [
+                      'Lane',
+                      jsx(Codicon, { name: direction < 0 ? 'arrow-down' : 'arrow-up', size: '0.625rem' })
+                    ]
+                  })
+                },
+                'lane'
+              ),
+              jsx('th', { children: 'Branch' }, 'branch'),
+              jsx('th', { children: 'Refs' }, 'refs'),
+              jsx('th', { children: 'Last activity' }, 'age')
+            ]
+          })
+        }),
+        jsx('tbody', {
+          children: rows.map(card =>
+            jsxs(
+              'tr',
+              {
+                children: [
+                  jsx('td', {
+                    children: jsx('button', {
+                      className: 'pcc-link',
+                      onClick: () => onOpenSession(card.sessionId),
+                      style: {
+                        border: 0,
+                        background: 'transparent',
+                        color: 'inherit',
+                        cursor: 'pointer',
+                        font: 'inherit',
+                        padding: 0,
+                        textAlign: 'left'
+                      },
+                      type: 'button',
+                      children: card.title
+                    })
+                  }),
+                  jsx('td', {
+                    children: card.projectId
+                      ? jsx('button', {
+                          className: 'pcc-link',
+                          onClick: () => onOpenProject(card.projectId),
+                          style: {
+                            border: 0,
+                            background: 'transparent',
+                            color: 'inherit',
+                            cursor: 'pointer',
+                            font: 'inherit',
+                            padding: 0,
+                            textAlign: 'left'
+                          },
+                          type: 'button',
+                          children: card.projectLabel
+                        })
+                      : jsx('span', { style: { color: 'var(--ui-text-quaternary)' }, children: 'No project' })
+                  }),
+                  jsx('td', {
+                    children: jsx(KanbanSelect, {
+                      ariaLabel: `Lane for ${card.title}`,
+                      disabled: !card.projectId,
+                      onChange: value => onMove(card, value),
+                      options: lanes.map(lane => ({ value: lane.id, label: lane.label })),
+                      style: { maxWidth: 150, height: 26 },
+                      value: card.lane
+                    })
+                  }),
+                  jsx('td', { children: jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }) }),
+                  jsx('td', { children: jsx(KanbanRefChip, { card }) }),
+                  jsx('td', {
+                    style: { color: 'var(--ui-text-quaternary)', whiteSpace: 'nowrap' },
+                    children: card.lastActivity ? ageText(card.lastActivity) : ''
+                  })
+                ]
+              },
+              card.id
+            )
+          )
+        })
+      ]
+    })
+  })
+}
+
+// Both views take the same filtered list and the same move handler; only the
+// arrangement changes.
+function KanbanViews({ byLane, counts, direction, dragCard, dropLane, lanes, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onSortLane, states, view }) {
+  if (view === 'table') {
+    const all = []
+
+    for (const lane of lanes) for (const card of byLane.get(lane.id) || []) all.push(card)
+
+    return jsx(KanbanTable, {
+      cards: all,
+      direction,
+      lanes,
+      onMove,
+      onOpenProject,
+      onOpenSession,
+      onSortLane
+    })
+  }
+
+  return jsx(Board, {
+    count: lanes.length,
+    children: lanes.map(lane =>
+      jsx(
+        KanbanColumn,
+        {
+          cards: byLane.get(lane.id) || [],
+          count: counts[lane.id] || 0,
+          dragId: dragCard ? dragCard.id : '',
+          dropLane,
+          lanes,
+          lane,
+          onDragEnd,
+          onDragOver,
+          onDragStart,
+          onDrop,
+          onMove,
+          onOpenProject,
+          onOpenSession,
+          states
+        },
+        lane.id
+      )
+    )
+  })
+}
+
+// The page. Everything it renders comes from three reads it shares with the
+// board: the tree (labels and folders), session.list (the cards themselves) and
+// /board (lanes and links). The kanban and the table are two views of one
+// filtered card list, so a filter can never apply to one and not the other.
+function SessionsKanbanPage() {
+  const [view, setView] = useState('kanban')
+  const [search, setSearch] = useState('')
+  const [projectFilter, setProjectFilter] = useState('')
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [staleOnly, setStaleOnly] = useState(false)
+  const [laneDirection, setLaneDirection] = useState(1)
+  const [dragCard, setDragCard] = useState(null)
+  const [dropLane, setDropLane] = useState('')
+  const [spin, setSpin] = useState(false)
+  const lanes = useValue($lanes)
+  const statuses = useValue($statuses)
+  const overrides = useValue($sessionStatus)
+
+  const tree = useQuery({
+    queryFn: () => host.request('projects.tree', { preview_limit: 5, ...profileParam() }),
+    queryKey: [QUERY_ROOT, 'tree'],
+    refetchInterval: TREE_MS,
+    staleTime: 4000
+  })
+
+  const sessionsQuery = useQuery({
+    queryFn: () => host.request('session.list', { limit: 200, ...profileParam() }),
+    queryKey: [QUERY_ROOT, 'sessions'],
+    refetchInterval: TREE_MS,
+    staleTime: 4000
+  })
+
+  const boardState = useBoard()
+  const live = useLiveSessions()
+
+  // A move this client posted is dropped as soon as the board echoes it, so a
+  // card never sits on a lane the store already disagrees with.
+  useEffect(() => {
+    reconcileSessionLanes(boardState.links)
+  }, [boardState.links])
+
+  const treeProjects = useMemo(() => (tree.data && tree.data.projects) || [], [tree.data])
+  const boardProjects = useMemo(
+    () => (boardState.data && Array.isArray(boardState.data.projects) ? boardState.data.projects : []),
+    [boardState.data]
+  )
+  // The tree knows labels and folders; the store may know a project the tree no
+  // longer lists, and its id is still what a link row names.
+  const projects = useMemo(() => {
+    const out = treeProjects.map(project => ({ ...project }))
+    const seen = new Set(out.map(project => project.id))
+
+    for (const row of boardProjects) {
+      if (!row || !row.project_id || seen.has(row.project_id)) continue
+      out.push({ id: row.project_id, label: row.label, path: (row.paths && row.paths[0]) || '' })
+      seen.add(row.project_id)
+    }
+
+    return out
+  }, [treeProjects, boardProjects])
+  const projectById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
+  const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
+  const refsByProject = useProjectRefs(projects, boardState.links)
+  const branches = useProjectBranches(projects)
+
+  const cards = useMemo(() => {
+    const rows = (
+      sessionsQuery.data && Array.isArray(sessionsQuery.data.sessions) ? sessionsQuery.data.sessions : []
+    ).filter(session => session && session.id)
+    const now = Date.now()
+
+    return rows.map(session => {
+      const link = linkBySession.get(session.id) || null
+      const projectId = String((link && link.project_id) || '')
+      const project = projectId ? projectById.get(projectId) : null
+      const folder = project ? primaryPath(project) : ''
+      const refs = projectId ? refsByProject.get(projectId) : null
+      const number = Number(link && link.pr)
+      const pr = refs && Number.isFinite(number) && number > 0 ? refs.get(number) || null : null
+      const card = buildKanbanCard({
+        session,
+        link,
+        project,
+        pr,
+        projectLane: projectId ? statuses[projectId] : '',
+        branch: folder ? branches[folder] : '',
+        now
+      })
+      const override = overrides[session.id]
+
+      return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
+    })
+  }, [sessionsQuery.data, linkBySession, projectById, refsByProject, statuses, branches, overrides])
+
+  const ordered = useMemo(() => normalizeKanbanLanes(lanes), [lanes])
+  const filtered = useMemo(
+    () => kanbanFilterCards(cards, { projectId: projectFilter, search, source: sourceFilter, staleOnly }),
+    [cards, projectFilter, search, sourceFilter, staleOnly]
+  )
+  const counts = useMemo(() => kanbanCounts(filtered, ordered), [filtered, ordered])
+  const byLane = useMemo(() => {
+    const map = new Map(ordered.map(lane => [lane.id, []]))
+
+    for (const card of filtered) {
+      const list = map.get(card.lane)
+
+      if (list) list.push(card)
+    }
+
+    for (const list of map.values()) list.sort((a, b) => b.lastActivity - a.lastActivity)
+
+    return map
+  }, [filtered, ordered])
+
+  const move = (card, status) => {
+    if (!card || !card.projectId || !card.sessionId || card.lane === status) return
+    writeSessionLane(card.projectId, card.sessionId, status)
+  }
+
+  const drop = laneId => {
+    const card = dragCard
+
+    setDragCard(null)
+    setDropLane('')
+    if (card && laneId) move(card, laneId)
+  }
+
+  const refresh = () => {
+    setSpin(true)
+    schedule(() => setSpin(false), 700)
+    queryClient.invalidateQueries({ queryKey: [QUERY_ROOT] })
+  }
+
+  const total = cards.length
+  const shown = filtered.length
+  const countLabel =
+    total === 0 ? '' : shown === total ? `${total} ${total === 1 ? 'session' : 'sessions'}` : `${shown} of ${total} sessions`
+  const projectOptions = [
+    { value: '', label: 'All projects' },
+    ...projects.map(project => ({ value: project.id, label: project.label || project.id }))
+  ]
+  const boardDown = total > 0 && boardState.query.isFetched && !boardState.live
+  let body
+
+  if (sessionsQuery.isLoading) {
+    body = jsx(BoardSkeleton, {})
+  } else if (sessionsQuery.isError && !sessionsQuery.data) {
+    body = jsx('div', {
+      style: { flex: '1 1 0', display: 'grid', placeItems: 'center', padding: 20 },
+      children: jsx(ErrorState, {
+        description: String((sessionsQuery.error && sessionsQuery.error.message) || 'The gateway did not return the session list.'),
+        title: 'Could not load sessions',
+        children: jsx(Button, { onClick: () => sessionsQuery.refetch(), size: 'sm', variant: 'outline', children: 'Try again' })
+      })
+    })
+  } else if (total === 0) {
+    body = jsx('div', {
+      style: { flex: '1 1 0', display: 'grid', placeItems: 'center' },
+      children: jsx(EmptyState, {
+        description: 'Sessions appear here once the gateway has one to list.',
+        title: 'No sessions yet'
+      })
+    })
+  } else if (shown === 0) {
+    body = jsx('div', {
+      style: { flex: '1 1 0', display: 'grid', placeItems: 'center' },
+      children: jsx(EmptyState, {
+        description: 'Clear a filter or try a different search.',
+        title: search.trim() ? `No sessions match "${search.trim()}"` : 'No sessions match these filters'
+      })
+    })
+  } else {
+    body = jsx(KanbanViews, {
+      byLane,
+      counts,
+      direction: laneDirection,
+      dragCard,
+      dropLane,
+      lanes: ordered,
+      onDragEnd: () => {
+        setDragCard(null)
+        setDropLane('')
+      },
+      onDragOver: setDropLane,
+      onDragStart: setDragCard,
+      onDrop: drop,
+      onMove: move,
+      onOpenProject: openProject,
+      onOpenSession: openSession,
+      onSortLane: () => setLaneDirection(dir => -dir),
+      states: live.byStored,
+      view
+    })
+  }
+
+  return jsxs('div', {
+    style: S.page,
+    children: [
+      jsx('style', { children: CSS_TEXT }),
+      jsxs('header', {
+        style: S.header,
+        children: [
+          jsx('h1', { style: S.title, children: 'Sessions' }),
+          jsx('span', { style: S.count, children: countLabel }),
+          jsx('span', { style: S.grow }),
+          jsx(SegmentedControl, { onChange: setView, options: KANBAN_VIEWS, sizing: 'content', value: view }),
+          jsx(LanesPopover, { lanes: ordered }),
+          jsx(Tip, {
+            label: 'Refresh',
+            children: jsx(Button, {
+              'aria-label': 'Refresh sessions',
+              disabled: spin,
+              onClick: refresh,
+              size: 'icon-xs',
+              variant: 'ghost',
+              children: jsx(Codicon, { name: 'refresh', size: '0.875rem', spinning: spin })
+            })
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: S.filters,
+        children: [
+          jsx(KanbanSelect, {
+            ariaLabel: 'Filter by project',
+            onChange: setProjectFilter,
+            options: projectOptions,
+            value: projectFilter
+          }),
+          jsx(KanbanSelect, {
+            ariaLabel: 'Filter by lane source',
+            onChange: setSourceFilter,
+            options: KANBAN_SOURCE_FILTERS,
+            value: sourceFilter
+          }),
+          jsx(Tip, {
+            label: 'Only sessions not in done, untouched for three days',
+            children: jsx(Button, {
+              'aria-pressed': staleOnly,
+              onClick: () => setStaleOnly(value => !value),
+              size: 'sm',
+              variant: staleOnly ? 'default' : 'outline',
+              children: [
+                jsx(Codicon, { name: 'clock', size: '0.875rem' }),
+                'Stale only'
+              ]
+            })
+          }),
+          jsx('span', { style: S.grow }),
+          jsx('div', {
+            style: S.searchWrap,
+            children: jsx(SearchField, {
+              'aria-label': 'Search sessions',
+              onChange: setSearch,
+              placeholder: 'Search title, project, branch or number',
+              value: search
+            })
+          })
+        ]
+      }),
+      boardDown
+        ? jsxs('div', {
+            style: S.notice,
+            children: [
+              jsx(Codicon, { name: 'warning', size: '0.875rem' }),
+              jsx('span', {
+                children: 'The board backend is not answering, so lanes fall back to each project lane.'
+              })
+            ]
+          })
+        : null,
+      body
+    ]
+  })
+}
+
 // ── titlebar ─────────────────────────────────────────────────────────────────
 
 // The `titleBar.left/center/right` areas are render SLOTS for page-owned chrome:
@@ -7417,6 +8658,7 @@ export default {
       })
     }
     $statuses.set(readStatuses())
+    $lanes.set(readLanes())
     $sort.set(readSort())
     $ghPreset.set(readGhPreset())
     $openProject.set(readOpenProject())
@@ -7427,7 +8669,12 @@ export default {
       // A second page, not a drawer: the board stays the board, and a project
       // gets a page of its own that a tab can hold.
       { id: 'project-page', area: ROUTES_AREA, title: 'Project', data: { path: PROJECT_ROUTE }, render: () => jsx(ProjectDetailPage, {}) },
+      // The session kanban: every project's sessions on one lane board.
+      { id: 'sessions-page', area: ROUTES_AREA, title: 'Sessions', data: { path: SESSIONS_ROUTE }, render: () => jsx(SessionsKanbanPage, {}) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: ROUTE, label: 'Projects', codicon: 'project' } },
+      // No `kanban` glyph in the Codicon set this app ships, so the nav uses the
+      // project glyph rather than a name the Codicon component cannot resolve.
+      { id: 'sessions-nav', area: SIDEBAR_NAV_AREA, data: { path: SESSIONS_ROUTE, label: 'Sessions', codicon: 'project' } },
       {
         id: 'open',
         area: PALETTE_AREA,
@@ -7436,6 +8683,16 @@ export default {
           label: 'Open Projects',
           keywords: ['projects', 'project', 'board', 'kanban', 'sessions', 'command center'],
           run: () => host.navigate(ROUTE)
+        }
+      },
+      {
+        id: 'open-sessions',
+        area: PALETTE_AREA,
+        data: {
+          id: `${PLUGIN_ID}.sessions`,
+          label: 'Open Sessions',
+          keywords: ['sessions', 'kanban', 'lanes', 'board', 'project', 'command center'],
+          run: () => host.navigate(SESSIONS_ROUTE)
         }
       }
     ])

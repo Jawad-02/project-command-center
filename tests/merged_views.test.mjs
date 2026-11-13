@@ -6,6 +6,10 @@
 // order, the kanban table helpers, then the merged-view helpers. The kanban
 // block defers to the lane block, and the merged-view helpers are pure.
 //
+// The page has two views now. Branches and Issues were folded into Projects, so
+// this suite proves the removed components are gone and a stored legacy value
+// opens Projects instead.
+//
 // Run with:
 //   node --test tests/merged_views.test.mjs
 
@@ -48,13 +52,6 @@ vm.runInThisContext(
     DEFAULT_VIEW,
     VIEW_IDS,
     normalizeView,
-    sortViewCards,
-    kanbanBranchGroups,
-    ISSUE_STATES,
-    kanbanIssueState,
-    kanbanIssueGroups,
-    cardAsSession,
-    cardLane,
     KANBAN_LANES,
     normalizeKanbanLanes,
     normalizeLaneTable,
@@ -80,6 +77,8 @@ vm.runInThisContext(
 )
 const M = globalThis.__PCC_MERGED__
 
+const DEFAULT_IDS = ['unfiled', 'backlog', 'active', 'review', 'blocked', 'done', 'canceled']
+
 const card = (over = {}) => ({
   id: 's1',
   sessionId: 's1',
@@ -99,18 +98,19 @@ const card = (over = {}) => ({
 
 // ── view switching state ────────────────────────────────────────────────────
 
-test('the one page has four views, Status first, and an unknown id lands there', () => {
-  assert.deepEqual(M.VIEW_IDS, ['status', 'projects', 'branches', 'issues'])
-  assert.deepEqual(M.VIEWS.map(view => view.label), ['Status', 'Projects', 'Branches', 'Issues'])
-  assert.equal(M.DEFAULT_VIEW, 'status')
+test('the one page has two views, Projects first, and a legacy value migrates', () => {
+  assert.deepEqual(M.VIEW_IDS, ['status', 'projects'])
+  assert.deepEqual(M.VIEWS.map(view => view.label), ['Status', 'Projects'])
+  assert.equal(M.DEFAULT_VIEW, 'projects')
 
   assert.equal(M.normalizeView(' STATUS '), 'status')
-  assert.equal(M.normalizeView('Branches'), 'branches')
-  assert.equal(M.normalizeView('issues'), 'issues')
-  assert.equal(M.normalizeView('sessions'), 'status')
-  assert.equal(M.normalizeView(''), 'status')
-  assert.equal(M.normalizeView(null), 'status')
-  assert.equal(M.normalizeView(42), 'status')
+  assert.equal(M.normalizeView('Projects'), 'projects')
+  assert.equal(M.normalizeView('branches'), 'projects')
+  assert.equal(M.normalizeView('issues'), 'projects')
+  assert.equal(M.normalizeView('sessions'), 'projects')
+  assert.equal(M.normalizeView(''), 'projects')
+  assert.equal(M.normalizeView(null), 'projects')
+  assert.equal(M.normalizeView(42), 'projects')
 })
 
 test('the view is the one route state kept, in ctx.storage', () => {
@@ -131,7 +131,7 @@ test('the view is the one route state kept, in ctx.storage', () => {
   assert.match(source, /\$view\.set\(readView\(\)\)/, 'register must seed the atom from storage')
 })
 
-test('the merged page renders one switcher over the four views', () => {
+test('the merged page renders one switcher over the two views', () => {
   const begin = source.indexOf('function ProjectCommandCenterPage()')
   const end = source.indexOf('\n}\n', begin)
 
@@ -140,16 +140,33 @@ test('the merged page renders one switcher over the four views', () => {
 
   assert.match(block, /useValue\(\$view\)/, 'the page must read the view atom')
   assert.match(block, /jsx\(ViewSwitcher, \{\}\)/, 'the page must render the switcher')
-  for (const view of ['projects', 'branches', 'issues']) {
-    assert.match(block, new RegExp(`view === '${view}'`), `the page must branch to ${view}`)
-  }
-  assert.match(block, /jsx\(SessionsKanbanPage, \{ embedded: true \}\)/, 'Status is the fallback view')
+  assert.match(block, /view === 'status'/, 'the page must branch to Status')
+  assert.match(block, /jsx\(ProjectsPage, \{ embedded: true \}\)/, 'everything else is the Projects board')
+  assert.doesNotMatch(block, /branches|issues/, 'no view may still branch on the removed ids')
 
   const switcher = source.slice(source.indexOf('function ViewSwitcher()'), source.indexOf('\n}\n', source.indexOf('function ViewSwitcher()')) + 3)
 
   assert.match(switcher, /options: VIEWS/, 'the switcher options are the constant list, so the width never moves')
   assert.match(switcher, /style: S\.viewSwitch/, 'the switcher sits in a fixed, non-growing wrapper')
   assert.match(source, /viewSwitch: \{ display: 'inline-flex', flex: 'none' \}/, 'the wrapper must not grow')
+})
+
+test('the removed grouped views and their helpers are gone', () => {
+  for (const gone of [
+    'SessionGroupView',
+    'GroupedSessions',
+    'GROUP_VIEWS',
+    'kanbanBranchGroups',
+    'kanbanIssueGroups',
+    'kanbanIssueState',
+    'ISSUE_STATES',
+    'cardAsSession',
+    'cardLane'
+  ]) {
+    assert.doesNotMatch(source, new RegExp(`\\b${gone}\\b`), `${gone} must be deleted, not left dead`)
+  }
+  // DetailSessionRow is still the project page's session row, so it stays.
+  assert.match(source, /function DetailSessionRow\(/, 'the project detail page still renders its row')
 })
 
 test('the separate sessions route, page and nav entry are gone', () => {
@@ -159,98 +176,25 @@ test('the separate sessions route, page and nav entry are gone', () => {
   assert.equal((source.match(/area: SIDEBAR_NAV_AREA/g) || []).length, 1, 'the sidebar keeps one entry')
 })
 
-test('the palette opens the three named views', () => {
+test('the palette opens the two named views and no Issues view', () => {
   const begin = source.indexOf("label: 'Open Projects'")
   const end = source.indexOf(']\n    ])', begin)
   const block = source.slice(begin, end > begin ? end : begin + 2000)
 
   assert.match(block, /label: 'Open Projects'[\s\S]*run: \(\) => openView\('projects'\)/)
   assert.match(block, /label: 'Open Sessions board'[\s\S]*run: \(\) => openView\('status'\)/)
-  assert.match(block, /label: 'Open Issues'[\s\S]*run: \(\) => openView\('issues'\)/)
-})
-
-// ── Branches view ──────────────────────────────────────────────────────────
-
-test('branches group across projects, newest first inside a group, biggest group first', () => {
-  const rows = [
-    card({ id: 'a', projectId: 'p1', branch: 'main', lastActivity: 10 }),
-    card({ id: 'b', projectId: 'p2', branch: 'feat/x', lastActivity: 30 }),
-    card({ id: 'c', projectId: 'p2', branch: 'main', lastActivity: 50 }),
-    card({ id: 'd', projectId: 'p1', branch: 'feat/x', lastActivity: 20 }),
-    card({ id: 'e', projectId: 'p3', branch: '', lastActivity: 5 })
-  ]
-  const groups = M.kanbanBranchGroups(rows)
-
-  // main (3, the empty branch folds into it), then feat/x (2).
-  assert.deepEqual(groups.map(group => group.label), ['main', 'feat/x'])
-  assert.deepEqual(groups[0].cards.map(row => row.id), ['c', 'a', 'e'])
-  assert.deepEqual(groups[1].cards.map(row => row.id), ['b', 'd'])
-  assert.equal(groups[0].key, 'branch:main')
-})
-
-test('the branch view reuses the project page row shape and its lane badge', () => {
-  const session = M.cardAsSession(card({ sessionId: 's9', title: 'Ship it', lastActivity: 1234 }))
-
-  assert.deepEqual(session, { id: 's9', title: 'Ship it', last_active: 1234 })
-  assert.deepEqual(M.cardLane(card({ lane: 'review', laneSource: 'pr' })), {
-    lane: 'review',
-    note: '',
-    source: 'pr'
-  })
-
-  const begin = source.indexOf('function GroupedSessions(')
-  const end = source.indexOf('\n}\n', begin)
-  const block = source.slice(begin, end + 3)
-
-  assert.match(block, /jsx\(\s*DetailSessionRow/, 'the rows are the project page row component')
-  assert.match(block, /lane: cardLane\(card\)/, 'the lane badge is fed from the card lane')
-  assert.match(block, /lanes,/, 'the badge can label a custom lane')
-})
-
-// ── Issues view ────────────────────────────────────────────────────────────
-
-test('the issue buckets are the five the view promises, in order', () => {
-  assert.deepEqual(M.ISSUE_STATES.map(state => state.label), ['Open', 'In review', 'Merged', 'Closed', 'Unlinked'])
-
-  assert.equal(M.kanbanIssueState(card({ prState: { state: 'open', merged: false } })), 'review')
-  assert.equal(M.kanbanIssueState(card({ prState: { state: 'open', merged: false, draft: true } })), 'review')
-  assert.equal(M.kanbanIssueState(card({ prState: { state: 'closed', merged: true } })), 'merged')
-  assert.equal(M.kanbanIssueState(card({ prState: { state: 'closed', merged: false } })), 'closed')
-  assert.equal(M.kanbanIssueState(card({ pr: 12 })), 'review')
-  assert.equal(M.kanbanIssueState(card({ issue: 7 })), 'open')
-  assert.equal(M.kanbanIssueState(card({})), 'unlinked')
-  assert.equal(M.kanbanIssueState(null), 'unlinked')
-})
-
-test('issue groups keep all five buckets and sort newest first', () => {
-  const rows = [
-    card({ id: 'a', issue: 7, lastActivity: 10 }),
-    card({ id: 'b', pr: 12, prState: { state: 'open', merged: false }, lastActivity: 20 }),
-    card({ id: 'c', pr: 13, prState: { state: 'closed', merged: true }, lastActivity: 30 }),
-    card({ id: 'd', pr: 14, prState: { state: 'closed', merged: false }, lastActivity: 40 }),
-    card({ id: 'e', lastActivity: 50 })
-  ]
-  const groups = M.kanbanIssueGroups(rows)
-
-  assert.deepEqual(groups.map(group => group.id), ['open', 'review', 'merged', 'closed', 'unlinked'])
-  assert.deepEqual(groups.map(group => group.cards.length), [1, 1, 1, 1, 1])
-
-  const twoOpen = M.kanbanIssueGroups([
-    card({ id: 'old', issue: 1, lastActivity: 1 }),
-    card({ id: 'new', issue: 2, lastActivity: 9 })
-  ])
-
-  assert.deepEqual(twoOpen[0].cards.map(row => row.id), ['new', 'old'])
+  assert.doesNotMatch(source, /label: 'Open Issues'/, 'the Issues palette entry is gone')
+  assert.doesNotMatch(source, /openView\('issues'\)/, 'nothing may open the removed view')
 })
 
 // ── lanes: the server read and the fallback ────────────────────────────────
 
-test('a server lane payload is kept as-is: custom ids, labels and order', () => {
+test('a server lane payload is kept as-is: custom ids, labels, order and system', () => {
   const rows = M.laneRowsFromResponse({
     ok: true,
     lanes: [
       { id: 'ideas', label: 'Ideas', order: 0, custom: true },
-      { id: 'active', label: 'Building', order: 1, custom: false },
+      { id: 'active', label: 'Building', order: 1, custom: false, system: 1 },
       { id: 'done', label: 'Shipped', order: 2, custom: false }
     ]
   })
@@ -259,6 +203,8 @@ test('a server lane payload is kept as-is: custom ids, labels and order', () => 
   assert.deepEqual(rows.map(row => row.label), ['Ideas', 'Building', 'Shipped'])
   assert.equal(rows[0].custom, true)
   assert.equal(rows[1].custom, undefined)
+  assert.equal(rows[1].system, true, 'a system lane keeps the flag the route sent')
+  assert.equal(rows[0].system, undefined)
 
   // Anything that is not the documented shape reads as "no server table".
   assert.equal(M.laneRowsFromResponse(null), null)
@@ -267,13 +213,13 @@ test('a server lane payload is kept as-is: custom ids, labels and order', () => 
   assert.equal(M.laneRowsFromResponse({ ok: true }), null)
 })
 
-test('a missing lane route falls back to the five defaults', () => {
+test('a missing lane route falls back to the seven default lanes', () => {
   // The page keeps rendering from ctx.storage, so the fallback table is the same
-  // five ids the old build seeded.
+  // seven ids the store seeds, unfiled first and canceled last.
   const stored = M.laneTableOrDefaults(null)
 
-  assert.deepEqual(M.laneIds(stored), ['backlog', 'active', 'review', 'blocked', 'done'])
-  assert.deepEqual(M.laneIds(M.laneTableOrDefaults(M.KANBAN_LANES)), ['backlog', 'active', 'review', 'blocked', 'done'])
+  assert.deepEqual(M.laneIds(stored), DEFAULT_IDS)
+  assert.deepEqual(M.laneIds(M.laneTableOrDefaults(M.KANBAN_LANES)), DEFAULT_IDS)
 })
 
 test('an unknown lane id renders in the first lane, not nowhere', () => {
@@ -287,7 +233,7 @@ test('an unknown lane id renders in the first lane, not nowhere', () => {
 
   assert.equal(M.lanePlace(table, 'done'), 'triage')
   assert.equal(M.lanePlace(table, 'active'), 'active')
-  assert.equal(M.lanePlace(M.laneTableOrDefaults(null), 'someday'), 'backlog')
+  assert.equal(M.lanePlace(M.laneTableOrDefaults(null), 'someday'), 'unfiled')
 
   const placed = M.kanbanPlaceCards([card({ id: 'x', lane: 'done' })], table)
 
@@ -383,6 +329,16 @@ test('the popover asks lane_in_use for a target and retries with reassign', () =
   assert.match(block, /children: 'Move and remove'/, 'the reassign retry is one click')
 })
 
+test('a system lane offers no delete control, only rename and reorder', () => {
+  const begin = source.indexOf('function LaneEditorRow(')
+  const end = source.indexOf('\n}\n', begin)
+  const block = source.slice(begin, end + 3)
+
+  assert.match(block, /lane\.system/, 'the row knows which lanes are system')
+  assert.match(block, /disabled: !live \|\| total <= 1 \|\| Boolean\(lane\.system\)/, 'a system lane cannot be removed')
+  assert.match(block, /children: 'system'/, 'the row labels the system lanes')
+})
+
 test('lane_in_use counts read from any of the shapes the route may carry', () => {
   assert.equal(M.laneUseCount(4, 'done'), 4)
   assert.equal(M.laneUseCount({ done: 3 }, 'done'), 3)
@@ -390,6 +346,54 @@ test('lane_in_use counts read from any of the shapes the route may carry', () =>
   assert.equal(M.laneUseCount({ done: { sessions: 5 } }, 'done'), 5)
   assert.equal(M.laneUseCount({ total: 6 }, 'done'), 6)
   assert.equal(M.laneUseCount(null, 'done'), 0)
+})
+
+// ── the projects view's session rendering ──────────────────────────────────
+
+test('the projects view renders every session and no longer truncates a column', () => {
+  assert.doesNotMatch(source, /BOARD_CARD_LIMIT/, 'the card limit constant is gone')
+  assert.doesNotMatch(source, /S\.more\b/, 'the "+N more" button style is gone')
+  const body = source.slice(source.indexOf('function ColumnBody('), source.indexOf('\n}\n', source.indexOf('function ColumnBody(')))
+  assert.doesNotMatch(body, /hidden > 0|\+\$\{hidden\}|S\.more/, 'the column body has no truncation branch')
+  assert.match(source, /preview_limit: TREE_PREVIEW_LIMIT/, 'the tree read asks for a window wide enough to show them all')
+  assert.match(source, /overflowY: 'auto'/, 'the column body scrolls instead of truncating')
+})
+
+test('the projects view carries the lane filter button, the visible count and storage', () => {
+  assert.match(source, /name: 'filter', size: '0\.875rem' \}\), 'Filter'/, 'the button is labelled Filter')
+  assert.match(source, /function SessionLaneFilter\(/, 'the popover is its own component')
+  assert.match(source, /type: 'checkbox'/, 'one checkbox per lane')
+  assert.match(source, /const LANE_FILTER_KEY = 'projectLaneFilter\.v1'/, 'the filter has a stable storage key')
+  assert.match(source, /storage\.get\(LANE_FILTER_KEY/, 'the filter is read from ctx.storage')
+  assert.match(source, /storage\.set\(LANE_FILTER_KEY/, 'a toggle writes ctx.storage')
+  assert.match(source, /of \$\{sessionCounts\.total\} sessions/, 'the page counts what is visible')
+})
+
+// ── row geometry ───────────────────────────────────────────────────────────
+
+test('project rows and detail rows are 60px tall with 8px vertical padding', () => {
+  const style = name => {
+    const begin = source.indexOf(`\n  ${name}: {`)
+    const end = source.indexOf('\n  },', begin)
+
+    assert.ok(begin >= 0, `S.${name} missing`)
+    const block = source.slice(begin, end)
+
+    assert.match(block, /minHeight: 60/, `S.${name} must be 60px tall`)
+    assert.match(block, /padding: '8px (10|12)px'/, `S.${name} needs 8px vertical padding`)
+    assert.match(block, /boxSizing: 'border-box'/, `S.${name} must count the padding inside the 60px`)
+  }
+
+  style('card')
+  style('sessionRow')
+
+  // One line with an ellipsis, and a badge that cannot wrap.
+  const title = source.slice(source.indexOf('\n  cardTitle: {'), source.indexOf('\n  },', source.indexOf('\n  cardTitle: {')))
+
+  assert.match(title, /whiteSpace: 'nowrap'/)
+  assert.match(title, /textOverflow: 'ellipsis'/)
+  assert.doesNotMatch(title, /WebkitLineClamp/, 'the title is one line, not two')
+  assert.match(source, /laneBadge: \{[^}]*whiteSpace: 'nowrap'/, 'the lane badge never wraps')
 })
 
 // ── the project page toggle ────────────────────────────────────────────────

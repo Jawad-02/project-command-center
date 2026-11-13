@@ -30,11 +30,16 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `POST /github/issue/{n}/state` | `{state}` | opens or closes an issue |
 | `POST /github/pr/{n}/state` | `{state}` | opens or closes a PR |
 | `POST /board/status` | `{project_id, status, note, session_id?, scope?}` | sets a project lane, or a session's lane when a session is named |
+| `POST /board/lanes` | `{id?, label, order?}` | creates a custom lane, or renames and/or moves a live one |
+| `POST /board/lanes/order` | `{ids: [...]}` | a permutation of the live lane ids, written as positions `0..n-1` |
+| `POST /board/lanes/delete` | `{id, reassign?}` | deletes a custom lane; `reassign` moves its rows in the same transaction |
 | `POST /board/link` | `{session_id, project_id, issue?, pr?, pr_url?}` | links a session to its work item |
 | `POST /board/projects` | `{project_id, label, paths}` | records a project and its folders |
 | `POST /board/seed` | `{}` | seeds project rows from Hermes Projects |
 
 `/branch/switch` refuses rather than forcing. Codes: `switched`, `already_on`, `dirty_tree`, `unknown_branch`, `bad_branch`, `not_a_repo`, `inside_root`, `not_main_worktree`, `checked_out_elsewhere`, `operation_in_progress`, `detached_unreachable`, `switch_failed`. Untracked files alone are allowed and reported as a warning.
+
+`/board/lanes/delete` refuses a system lane (`system_lane`), an unknown id (`unknown_lane`), the last lane (`last_lane`), and a lane rows still hold without `reassign` (`lane_in_use`, carrying the counts). The seven system lanes (`unfiled`, `backlog`, `active`, `review`, `blocked`, `done`, `canceled`) can be renamed and reordered but never removed; a lane nothing claims is `unfiled`, never `backlog`.
 
 `/worktree` creates and never repairs. Refusal codes: `folder_missing`, `not_a_repo`, `bad_branch`, `bad_slug`, `worktree_exists`, `branch_checked_out`, `unknown_base`, `worktree_failed`, `upstream_error`. The target is always `<mainRoot>/.worktrees/<slug>`, where mainRoot is the first record of `git worktree list --porcelain`; a directory already on disk is a refusal, never a reuse, and the branch is checked out as it is when it exists locally or made from `base` (defaulting to `origin/<branch>` only when that ref resolves).
 

@@ -4162,11 +4162,12 @@ def board_status(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
 
 @router.get("/board/lanes")
 def board_lanes() -> dict[str, Any]:
-    """Every lane definition, sorted by position: ``{id, label, order, custom}``.
+    """Every lane definition, sorted by position: ``{id, label, order, custom, system}``.
 
     Lanes are board data now, not a constant: the Desktop renames, reorders and adds them through
-    the two routes below, and every write path validates against the same table. A broken database
-    is ``ok: false, code: store_error`` with an empty list, like ``/board``.
+    the two routes below, and every write path validates against the same table. The seven seeded
+    rows are ``system`` lanes (``unfiled`` through ``canceled``); they can be renamed and moved but
+    not deleted. A broken database is ``ok: false, code: store_error`` with an empty list.
     """
     try:
         return {"ok": True, "lanes": _board_store().lanes()}
@@ -4207,11 +4208,12 @@ def board_lanes_order(payload: dict[str, Any] = Body(default={})) -> dict[str, A
 
 @router.post("/board/lanes/delete")
 def board_lane_delete(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Delete a lane: body ``{id, reassign?}``.
+    """Delete a custom lane: body ``{id, reassign?}``.
 
-    The last lane is ``code: last_lane`` and an unknown id is ``code: unknown_lane``. A lane that
-    project statuses or session links still hold is ``code: lane_in_use`` with the counts unless
-    ``reassign`` names another live lane; with it those rows move in the same transaction.
+    A system lane is ``code: system_lane`` (rename or reorder it instead), the last lane is
+    ``code: last_lane`` and an unknown id is ``code: unknown_lane``. A lane that project statuses
+    or session links still hold is ``code: lane_in_use`` with the counts unless ``reassign`` names
+    another live lane; with it those rows move in the same transaction.
     """
     try:
         result = _board_store().delete_lane(payload.get("id"), payload.get("reassign"))

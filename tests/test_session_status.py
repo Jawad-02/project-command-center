@@ -289,8 +289,9 @@ def main() -> int:
           fallback["status"] == "active" and fallback["scope"] == "project"
           and fallback["note"] == "project note")
     empty = store.resolve_lane({}, {})
-    check("neither set answers an empty lane",
-          empty == {"status": "", "scope": "", "source": "", "note": "", "updated_at": None},
+    check("neither set answers Unfiled, never Backlog",
+          empty == {"status": "unfiled", "scope": "", "source": "unset", "note": "",
+                    "updated_at": None},
           str(empty))
     card = store.session_card("s-old")
     check("session_card carries the resolved lane", card.get("lane", {}).get("status") == "blocked",

@@ -2,8 +2,14 @@
 """Lane definitions are data: schema, migration, validation and the lane routes' store calls.
 
 Plain Python like tests/test_session_status.py, no pytest. It builds a scratch home, opens the
-store (which creates and seeds the ``lanes`` table), and exercises the five seeds, custom lanes,
-reordering, deletion with reassignment, and the read fallback for an id that is no longer live.
+store (which creates and seeds the ``lanes`` table), and exercises the seven system lanes, custom
+lanes, reordering, deletion with reassignment, the system_lane refusal, the Unfiled fallback and
+the done/canceled derivation from a linked item.
+
+A second pass runs the same module in a subprocess against a database written with the OLD five
+lane rows and no ``system`` column, which is the shape a live ``board.db`` has: the missing two
+lanes are inserted, all seven are marked system, the order is rewritten once, and a later open
+leaves a user reorder alone.
 
     python3 tests/test_lanes.py
 
@@ -24,7 +30,9 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +40,11 @@ PLUGIN = Path(__file__).resolve().parent.parent
 SCRATCH = Path(os.environ.get("PCC_LANES_SCRATCH",
                               Path.home() / ".hermes" / "cache" / "scratch" / "pcc-lanes"))
 FAILURES: list[str] = []
-DEFAULT_IDS = ["backlog", "active", "review", "blocked", "done"]
-DEFAULT_LABELS = ["Backlog", "Active", "Review", "Blocked", "Done"]
+DEFAULT_IDS = ["unfiled", "backlog", "active", "review", "blocked", "done", "canceled"]
+DEFAULT_LABELS = ["Unfiled", "Backlog", "Active", "Review", "Blocked", "Done", "Canceled"]
+# The shape a board.db written before the lanes table held system rows has.
+OLD_IDS = ["backlog", "active", "review", "blocked", "done"]
+OLD_LABELS = ["Backlog", "Active", "Review", "Blocked", "Done"]
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -71,7 +82,98 @@ def positions(rows: list[dict[str, Any]]) -> list[int]:
     return [row["order"] for row in rows]
 
 
+def write_old_board(db: Path) -> None:
+    """The live shape before this change: five default lanes, no ``system`` column, one custom."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE lanes (id TEXT PRIMARY KEY, label TEXT NOT NULL, position INTEGER NOT NULL,"
+            " custom INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO lanes (id, label, position, custom, created_at) VALUES (?, ?, ?, 0, ?)",
+            [(lane_id, label, position, now)
+             for position, (lane_id, label) in enumerate(zip(OLD_IDS, OLD_LABELS))])
+        # A custom lane a user added before the upgrade: it must survive the migration and keep
+        # its place behind the seven system lanes.
+        conn.execute(
+            "INSERT INTO lanes (id, label, position, custom, created_at) VALUES (?, ?, ?, 1, ?)",
+            ("qa-pending", "QA Pending", len(OLD_IDS), now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migration() -> int:
+    """Child process: open a five-lane board and prove the one-time system migration."""
+    db = SCRATCH / "mig-home" / "plugin-data" / "project-command-center" / "board.db"
+    print(f"HERMES_HOME={db.parent.parent.parent}")
+    store = load("pcc_lanes_mig_store", PLUGIN / "board_store.py")
+
+    section("migration / a five-lane board gains unfiled and canceled, once")
+    opened = store.board()
+    check("the old board opens", opened.get("ok") is True, str(opened.get("code")))
+    rows = store.lanes()
+    print(f"  lanes: {json.dumps(rows, default=str)}")
+    check("the seven system lanes are live, in the documented order",
+          ids_of(rows)[:7] == DEFAULT_IDS, str(ids_of(rows)))
+    check("the two inserted lanes carry the seed labels",
+          [row["label"] for row in rows[:7]] == DEFAULT_LABELS,
+          str([row["label"] for row in rows[:7]]))
+    check("positions are 0..n-1", positions(rows) == list(range(len(rows))), str(positions(rows)))
+    check("every seeded lane is marked system",
+          all(by_id(rows, lane).get("system") == 1 for lane in DEFAULT_IDS),
+          str([(row["id"], row["system"]) for row in rows]))
+    check("the five pre-existing lanes are not marked custom",
+          all(by_id(rows, lane).get("custom") == 0 for lane in DEFAULT_IDS),
+          str([(row["id"], row["custom"]) for row in rows]))
+    check("the custom lane survived, behind the system lanes",
+          ids_of(rows)[7:] == ["qa-pending"], str(ids_of(rows)))
+
+    section("migration / a second open is a no-op")
+    store._schema_ready.discard(store._db_path())
+    conn = store._connect()
+    try:
+        count = conn.execute("SELECT count(*) FROM lanes").fetchone()[0]
+    finally:
+        conn.close()
+    check("no lane was inserted twice", count == 8, str(count))
+    check("the ids did not move", ids_of(store.lanes()) == DEFAULT_IDS + ["qa-pending"],
+          str(store.lane_ids()))
+
+    section("migration / a user reorder after the upgrade survives the next open")
+    reordered = store.reorder_lanes(list(reversed(store.lane_ids())))
+    check("the reorder is accepted", reordered.get("ok") is True, str(reordered.get("code")))
+    store._schema_ready.discard(store._db_path())
+    store._connect().close()
+    check("the reopened board keeps the user's order",
+          ids_of(store.lanes()) == list(reversed(DEFAULT_IDS + ["qa-pending"])),
+          str(store.lane_ids()))
+
+    section("migration / the new lanes accept writes and refuse deletion")
+    store.set_projects([{"id": "pcc-mig", "label": "Migrated board"}])
+    wrote = store.set_status("pcc-mig", "canceled", "dropped", "user", scope="project")
+    check("a project lane write to canceled succeeds", wrote.get("ok") is True,
+          str(wrote.get("code")))
+    refused = store.delete_lane("unfiled")
+    check("deleting unfiled is system_lane", refused.get("code") == "system_lane",
+          str(refused.get("code")))
+    check("the custom lane is still deletable",
+          store.delete_lane("qa-pending").get("ok") is True)
+
+    print()
+    if FAILURES:
+        print(f"FAILED: {len(FAILURES)} check(s): " + ", ".join(FAILURES))
+        return 1
+    print("migration checks ok")
+    return 0
+
+
 def main() -> int:
+    if "--migration" in sys.argv:
+        return migration()
+
     home = (SCRATCH / "home").resolve()
     if home == (Path.home() / ".hermes").resolve():
         sys.exit("refusing to run against the real ~/.hermes; point PCC_LANES_SCRATCH elsewhere")
@@ -89,18 +191,20 @@ def main() -> int:
     db = data / "board.db"
 
     # --- seed ----------------------------------------------------------------
-    section("seed / a fresh database starts with the five default lanes")
+    section("seed / a fresh database starts with the seven system lanes")
     opened = store.board()
     check("a fresh board opens", opened.get("ok") is True, str(opened.get("code")))
     rows = store.lanes()
     print(f"  lanes: {json.dumps(rows, default=str)}")
-    check("the seed ids are the five defaults, in order", ids_of(rows) == DEFAULT_IDS,
+    check("the seed ids are the seven lanes, in order", ids_of(rows) == DEFAULT_IDS,
           str(ids_of(rows)))
-    check("the seed labels are the five defaults", [row["label"] for row in rows] == DEFAULT_LABELS,
+    check("the seed labels are the seven defaults", [row["label"] for row in rows] == DEFAULT_LABELS,
           str([row["label"] for row in rows]))
-    check("positions are 0..4", positions(rows) == [0, 1, 2, 3, 4], str(positions(rows)))
+    check("positions are 0..6", positions(rows) == [0, 1, 2, 3, 4, 5, 6], str(positions(rows)))
     check("seeded lanes are not custom", all(row["custom"] == 0 for row in rows),
           str([row["custom"] for row in rows]))
+    check("seeded lanes are system", all(row["system"] == 1 for row in rows),
+          str([row["system"] for row in rows]))
     check("lane_ids() reads the same order", store.lane_ids() == DEFAULT_IDS, str(store.lane_ids()))
 
     section("seed / a second open does not duplicate the seed")
@@ -110,7 +214,7 @@ def main() -> int:
         count = conn.execute("SELECT count(*) FROM lanes").fetchone()[0]
     finally:
         conn.close()
-    check("the lanes table still holds exactly five rows", count == 5, str(count))
+    check("the lanes table still holds exactly seven rows", count == 7, str(count))
     check("the ids did not move on the second open", store.lane_ids() == DEFAULT_IDS,
           str(store.lane_ids()))
 
@@ -118,7 +222,7 @@ def main() -> int:
                                   "paths": [str(PLUGIN)]}])
     check("a project is synced for the write cases", synced.get("ok") is True, str(synced.get("code")))
 
-    section("writes / the five seed ids keep working")
+    section("writes / every system id keeps working, including unfiled and canceled")
     for lane in DEFAULT_IDS:
         wrote = store.set_status("pcc", lane, None, "user", scope="project")
         read_back = (store.get_status("pcc") or {}).get("status")
@@ -126,16 +230,61 @@ def main() -> int:
               wrote.get("ok") is True and read_back == lane,
               f"{wrote.get('code')} / {read_back!r}")
 
-    # --- create, rename, reorder --------------------------------------------
+    # --- the Unfiled fallback and the derivation ------------------------------
+    section("reads / nothing set anywhere is Unfiled, never Backlog")
+    empty = store.resolve_lane({}, {})
+    check("no status, no item and no project lane answers unfiled",
+          empty == {"status": "unfiled", "scope": "", "source": "unset",
+                    "note": "", "updated_at": None}, str(empty))
+    check("the pure call without a lane table answers unfiled too",
+          store.resolve_lane(None, None)["status"] == "unfiled",
+          str(store.resolve_lane(None, None)))
+    check("an explicit session lane still wins over the fallback",
+          store.resolve_lane({"status": "active", "status_source": "user"}, {})["status"] == "active")
+    check("a project lane still wins over unfiled",
+          store.resolve_lane({}, {"status": "review"})["status"] == "review")
+
+    section("reads / done and canceled derive from a linked PR or issue")
+    merged = store.resolve_lane({"pr_state": {"state": "closed", "merged": True}}, {})
+    check("a merged PR derives done",
+          merged["status"] == "done" and merged["source"] == "auto", str(merged))
+    closed = store.resolve_lane({"pr_state": {"state": "closed", "merged": False}}, {})
+    check("a closed-unmerged PR derives canceled", closed["status"] == "canceled", str(closed))
+    open_pr = store.resolve_lane({"pr_state": {"state": "open", "merged": False}}, {})
+    check("an open PR derives nothing and falls to unfiled", open_pr["status"] == "unfiled",
+          str(open_pr))
+    done_issue = store.resolve_lane({"issue_state": "closed", "issue_state_reason": "completed"}, {})
+    check("an issue closed as completed derives done", done_issue["status"] == "done",
+          str(done_issue))
+    no_reason = store.resolve_lane({"issue_state": "closed", "issue_state_reason": ""}, {})
+    check("an issue closed with no reason derives done", no_reason["status"] == "done",
+          str(no_reason))
+    dropped = store.resolve_lane({"issue_state": "closed",
+                                  "issue_state_reason": "not_planned"}, {})
+    check("an issue closed as not planned derives canceled", dropped["status"] == "canceled",
+          str(dropped))
+    dupe = store.resolve_lane({"issue_state": "closed", "issue_state_reason": "duplicate"}, {})
+    check("an issue closed as duplicate derives canceled", dupe["status"] == "canceled",
+          str(dupe))
+    open_issue = store.resolve_lane({"issue_state": "open", "issue_state_reason": ""},
+                                    {"status": "active"})
+    check("an open issue leaves the project lane alone", open_issue["status"] == "active",
+          str(open_issue))
+    explicit = store.resolve_lane({"status": "review", "status_source": "user",
+                                   "pr_state": {"state": "closed", "merged": True}}, {})
+    check("an explicit lane wins over the derivation",
+          explicit["status"] == "review" and explicit["source"] == "user", str(explicit))
+
+    # --- create, rename, reorder ---------------------------------------------
     section("lanes / create, rename and reorder")
     made = store.save_lane(None, "QA Pending")
     print(f"  create: {json.dumps(made, default=str)}")
     check("a created lane is ok and slugs its label",
           made.get("ok") is True and made.get("lane") == "qa-pending", str(made.get("code")))
     entry = by_id(made.get("lanes") or [], "qa-pending")
-    check("the new lane is custom, labelled and appended",
-          entry.get("custom") == 1 and entry.get("label") == "QA Pending" and entry.get("order") == 5,
-          str(entry))
+    check("the new lane is custom, not system, labelled and appended",
+          entry.get("custom") == 1 and entry.get("system") == 0
+          and entry.get("label") == "QA Pending" and entry.get("order") == 7, str(entry))
     check("the live ids now end with the custom lane",
           store.lane_ids() == DEFAULT_IDS + ["qa-pending"], str(store.lane_ids()))
 
@@ -143,16 +292,19 @@ def main() -> int:
     check("a rename keeps the id and changes the label",
           renamed.get("ok") is True and by_id(renamed.get("lanes") or [], "qa-pending")
           .get("label") == "QA Queue", str(renamed.get("code")))
+    check("a system lane can be renamed",
+          by_id(store.save_lane("review", "In review").get("lanes") or [], "review").get("label")
+          == "In review")
 
     moved = store.save_lane("qa-pending", None, 1)
     check("a reorder moves the lane to the requested position",
           moved.get("ok") is True and by_id(moved.get("lanes") or [], "qa-pending")
           .get("order") == 1, str(moved.get("code")))
     check("a move renumbers every position 0..n-1",
-          ids_of(moved.get("lanes") or []) == ["backlog", "qa-pending", "active", "review",
-                                               "blocked", "done"],
+          ids_of(moved.get("lanes") or []) == ["unfiled", "qa-pending", "backlog", "active",
+                                               "review", "blocked", "done", "canceled"],
           str(ids_of(moved.get("lanes") or [])))
-    restored = store.save_lane("qa-pending", None, 5)
+    restored = store.save_lane("qa-pending", None, 7)
     check("moving it back restores the seed order",
           ids_of(restored.get("lanes") or []) == DEFAULT_IDS + ["qa-pending"],
           str(ids_of(restored.get("lanes") or [])))
@@ -164,9 +316,9 @@ def main() -> int:
     dup_label = store.save_lane(None, "QA   pending!")
     check("a differently spelled label with the same slug is the same duplicate",
           dup_label.get("code") == "lane_exists", str(dup_label.get("code")))
-    empty = store.save_lane(None, "!!!")
-    check("a label that slugs to nothing is bad_label", empty.get("code") == "bad_label",
-          str(empty.get("code")))
+    empty_label = store.save_lane(None, "!!!")
+    check("a label that slugs to nothing is bad_label", empty_label.get("code") == "bad_label",
+          str(empty_label.get("code")))
 
     bad_order = store.reorder_lanes(["backlog", "active"])
     check("an order that is not a permutation is refused",
@@ -218,8 +370,19 @@ def main() -> int:
     check("the session row actually moved", (store.get_link("s-qa") or {}).get("status") == "active",
           str((store.get_link("s-qa") or {}).get("status")))
     check("the deleted lane is gone", "qa-pending" not in store.lane_ids(), str(store.lane_ids()))
-    check("the survivors are renumbered 0..n-1", positions(store.lanes()) == [0, 1, 2, 3, 4],
+    check("the survivors are renumbered 0..6", positions(store.lanes()) == [0, 1, 2, 3, 4, 5, 6],
           str(positions(store.lanes())))
+
+    section("lanes / a system lane cannot be deleted, renamed or moved only")
+    for lane in DEFAULT_IDS:
+        gone = store.delete_lane(lane)
+        check(f"deleting system lane {lane!r} is system_lane",
+              gone.get("ok") is False and gone.get("code") == "system_lane", str(gone.get("code")))
+    check("every system lane survived", store.lane_ids() == DEFAULT_IDS, str(store.lane_ids()))
+    check("a system lane can still be reordered",
+          store.reorder_lanes(["review", "unfiled", "backlog", "active", "blocked", "done",
+                               "canceled"]).get("ok") is True)
+    store.reorder_lanes(DEFAULT_IDS)
 
     section("lanes / unknown ids and bad shapes")
     unknown_rename = store.save_lane("ghost", "Ghost")
@@ -269,17 +432,17 @@ def main() -> int:
           str(ghost_project.get("lane")))
     store.set_status("pcc", "active", None, "user", scope="project")
 
-    # --- last lane -----------------------------------------------------------
-    section("lanes / the last lane cannot be deleted")
-    for lane in ("backlog", "review", "blocked", "done"):
-        gone = store.delete_lane(lane)
-        check(f"deleting unused default lane {lane!r} is allowed", gone.get("ok") is True,
-              str(gone.get("code")))
-    check("only one lane is left", store.lane_ids() == ["active"], str(store.lane_ids()))
-    last = store.delete_lane("active")
-    check("deleting the last lane is last_lane",
-          last.get("ok") is False and last.get("code") == "last_lane", str(last.get("code")))
-    check("the last lane survived", store.lane_ids() == ["active"], str(store.lane_ids()))
+    # --- migration -----------------------------------------------------------
+    section("migration / a five-lane board upgrades in a clean process")
+    write_old_board(SCRATCH / "mig-home" / "plugin-data" / "project-command-center" / "board.db")
+    env = dict(os.environ, HERMES_HOME=str(SCRATCH / "mig-home"),
+               PCC_LANES_SCRATCH=str(SCRATCH), TERMINAL_CWD=str(outside))
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--migration"],
+                            capture_output=True, text=True, env=env)
+    print(result.stdout.rstrip())
+    if result.returncode != 0:
+        print(result.stderr.rstrip())
+    check("the migration pass is green", result.returncode == 0, f"exit {result.returncode}")
 
     # --- routes --------------------------------------------------------------
     section("routes / lanes routes keep the board conventions: HTTP 200 with a code")
@@ -310,14 +473,18 @@ def main() -> int:
 
     code, listed = call("get", "/board/lanes")
     print(f"  GET:  HTTP {code} {json.dumps(listed, default=str)}")
-    check("GET /board/lanes answers the one remaining lane",
-          code == 200 and listed.get("ok") is True and ids_of(listed.get("lanes") or []) == ["active"],
+    check("GET /board/lanes answers the seven system lanes",
+          code == 200 and listed.get("ok") is True and ids_of(listed.get("lanes") or []) == DEFAULT_IDS,
           f"HTTP {code} {listed.get('code')}")
+    check("every row carries system: 0|1",
+          all(row.get("system") == 1 for row in listed.get("lanes") or []),
+          str([(row.get("id"), row.get("system")) for row in listed.get("lanes") or []]))
 
     code, created = call("post", "/board/lanes", {"label": "Route Lane"})
     check("POST /board/lanes creates a slugged custom lane",
           code == 200 and created.get("ok") is True and created.get("lane") == "route-lane"
-          and by_id(created.get("lanes") or [], "route-lane").get("custom") == 1,
+          and by_id(created.get("lanes") or [], "route-lane").get("custom") == 1
+          and by_id(created.get("lanes") or [], "route-lane").get("system") == 0,
           f"HTTP {code} {created.get('code')}")
 
     code, dupe = call("post", "/board/lanes", {"label": "Route Lane"})
@@ -331,31 +498,34 @@ def main() -> int:
           and by_id(renamed.get("lanes") or [], "route-lane").get("label") == "Route Renamed",
           f"HTTP {code} {renamed.get('code')}")
 
-    code, ordered = call("post", "/board/lanes/order", {"ids": ["route-lane", "active"]})
+    code, ordered = call("post", "/board/lanes/order",
+                         {"ids": ["route-lane"] + DEFAULT_IDS})
     check("an order permutation is accepted",
           code == 200 and ordered.get("ok") is True
-          and ids_of(ordered.get("lanes") or []) == ["route-lane", "active"],
+          and ids_of(ordered.get("lanes") or []) == ["route-lane"] + DEFAULT_IDS,
           f"HTTP {code} {ordered.get('code')}")
 
     code, bad = call("post", "/board/lanes/order", {"ids": ["route-lane"]})
     check("a non permutation is HTTP 200 bad_order",
           code == 200 and bad.get("ok") is False and bad.get("code") == "bad_order",
           f"HTTP {code} {bad.get('code')}")
-    code, back = call("post", "/board/lanes/order", {"ids": ["active", "route-lane"]})
+    code, back = call("post", "/board/lanes/order", {"ids": DEFAULT_IDS + ["route-lane"]})
     check("the order can be restored", code == 200 and back.get("ok") is True,
           f"HTTP {code} {back.get('code')}")
 
+    code, system_gone = call("post", "/board/lanes/delete", {"id": "review"})
+    check("deleting a system lane through the route is system_lane",
+          code == 200 and system_gone.get("ok") is False
+          and system_gone.get("code") == "system_lane", f"HTTP {code} {system_gone.get('code')}")
+
     code, gone = call("post", "/board/lanes/delete", {"id": "route-lane"})
-    check("an unused lane deletes through the route",
-          code == 200 and gone.get("ok") is True and store.lane_ids() == ["active"],
+    check("an unused custom lane deletes through the route",
+          code == 200 and gone.get("ok") is True and store.lane_ids() == DEFAULT_IDS,
           f"HTTP {code} {gone.get('code')}")
     code, unknown = call("post", "/board/lanes/delete", {"id": "route-lane"})
     check("deleting an unknown lane is HTTP 200 unknown_lane",
           code == 200 and unknown.get("code") == "unknown_lane",
           f"HTTP {code} {unknown.get('code')}")
-    code, last = call("post", "/board/lanes/delete", {"id": "active"})
-    check("deleting the last lane through the route is last_lane",
-          code == 200 and last.get("code") == "last_lane", f"HTTP {code} {last.get('code')}")
 
     print()
     if FAILURES:

@@ -40,9 +40,13 @@ function slice(begin, end) {
 
 const laneBlock = slice('// session-lane:begin', '// session-lane:end')
 const kanbanBlock = slice('// session-kanban:begin', '// session-kanban:end')
+// The view table lives in its own block: the suite loads it too, because the
+// view migration and the lane filter are the two page-level rules this suite
+// pins alongside the pure kanban helpers.
+const viewsBlock = slice('// merged-views:begin', '// merged-views:end')
 
 vm.runInThisContext(
-  `${laneBlock}\n${kanbanBlock}\n;globalThis.__PCC_KANBAN__ = {
+  `${laneBlock}\n${kanbanBlock}\n${viewsBlock}\n;globalThis.__PCC_KANBAN__ = {
     KANBAN_LANES,
     KANBAN_LANE_IDS,
     KANBAN_STALE_MS,
@@ -55,18 +59,29 @@ vm.runInThisContext(
     kanbanFilterCards,
     kanbanCounts,
     sortKanbanCards,
-    kanbanMoveBody
+    kanbanMoveBody,
+    normalizeLaneTable,
+    normalizeLaneFilter,
+    laneFilterAllows,
+    VIEWS,
+    VIEW_IDS,
+    DEFAULT_VIEW,
+    normalizeView
   }`,
   { filename: PLUGIN }
 )
 const K = globalThis.__PCC_KANBAN__
 
-const DEFAULT_IDS = ['backlog', 'active', 'review', 'blocked', 'done']
+const DEFAULT_IDS = ['unfiled', 'backlog', 'active', 'review', 'blocked', 'done', 'canceled']
 const ids = lanes => lanes.map(lane => lane.id)
 
 const mergedPr = { number: 8, state: 'closed', merged: true, draft: false }
 const openPr = { number: 6, state: 'open', merged: false, draft: false }
 const draftPr = { number: 7, state: 'open', merged: false, draft: true }
+const closedPr = { number: 9, state: 'closed', merged: false, draft: false }
+const doneIssue = { number: 4, kind: 'issue', state: 'closed', state_reason: 'completed' }
+const canceledIssue = { number: 5, kind: 'issue', state: 'closed', state_reason: 'not_planned' }
+const openIssue = { number: 3, kind: 'issue', state: 'open', state_reason: null }
 
 const card = (over = {}) => ({
   title: 'Fix the thing',
@@ -82,16 +97,22 @@ const card = (over = {}) => ({
   ...over
 })
 
-test('the default lanes are the store ids in order, with labels and an order each', () => {
+test('the default lanes are the seven system ids in order, with labels and an order each', () => {
   const lanes = K.normalizeKanbanLanes([])
 
   assert.deepEqual(ids(lanes), DEFAULT_IDS)
-  assert.deepEqual(lanes.map(lane => lane.label), ['Backlog', 'Active', 'Review', 'Blocked', 'Done'])
-  assert.deepEqual(lanes.map(lane => lane.order), [0, 1, 2, 3, 4])
+  assert.deepEqual(
+    lanes.map(lane => lane.label),
+    ['Unfiled', 'Backlog', 'Active', 'Review', 'Blocked', 'Done', 'Canceled']
+  )
+  assert.deepEqual(lanes.map(lane => lane.order), [0, 1, 2, 3, 4, 5, 6])
   assert.deepEqual(K.KANBAN_LANE_IDS, DEFAULT_IDS)
+  // The fallback table marks every one of them system, so the renderer can refuse
+  // to offer a delete for a lane it fell back to.
+  assert.ok(K.KANBAN_LANES.every(lane => lane.system === true))
 })
 
-test('lane resolution matches the store: session, then PR, then project, then backlog', () => {
+test('lane resolution matches the store: session, then linked item, then project, then unfiled', () => {
   const explicit = K.kanbanLaneFor({ status: 'blocked', status_source: 'agent', note: 'waiting' }, openPr, 'done')
 
   assert.equal(explicit.lane, 'blocked')
@@ -103,8 +124,11 @@ test('lane resolution matches the store: session, then PR, then project, then ba
   assert.equal(merged.lane, 'done')
   assert.equal(merged.source, 'pr')
 
-  assert.equal(K.kanbanLaneFor({}, openPr, '').lane, 'review')
-  assert.equal(K.kanbanLaneFor({}, draftPr, '').lane, 'review')
+  // A closed PR derives canceled; an open or draft PR derives nothing and the
+  // next rule answers (here: unfiled, because no project lane is set).
+  assert.equal(K.kanbanLaneFor({}, closedPr, '').lane, 'canceled')
+  assert.equal(K.kanbanLaneFor({}, openPr, '').lane, 'unfiled')
+  assert.equal(K.kanbanLaneFor({}, draftPr, '').lane, 'unfiled')
 
   const project = K.kanbanLaneFor(null, null, 'review')
 
@@ -113,13 +137,13 @@ test('lane resolution matches the store: session, then PR, then project, then ba
 
   const empty = K.kanbanLaneFor(null, null, '')
 
-  assert.equal(empty.lane, 'backlog')
+  assert.equal(empty.lane, 'unfiled')
   assert.equal(empty.source, 'unset')
 
   // An unknown explicit value is not a lane: the next rule answers instead.
   assert.equal(K.kanbanLaneFor({ status: 'shipped' }, null, 'blocked').lane, 'blocked')
-  // A project id that is not one of the five falls through to backlog.
-  assert.equal(K.kanbanLaneFor(null, null, 'someday').lane, 'backlog')
+  // A project id that is not a live lane falls through to unfiled, never backlog.
+  assert.equal(K.kanbanLaneFor(null, null, 'someday').lane, 'unfiled')
 })
 
 test('the provenance words are the four the card promises', () => {
@@ -177,14 +201,10 @@ test('column counts follow the filtered list, not the raw one', () => {
   ]
   const lanes = K.normalizeKanbanLanes([])
 
-  assert.deepEqual(K.kanbanCounts(rows, lanes), { backlog: 0, active: 2, review: 1, blocked: 0, done: 0 })
-  assert.deepEqual(K.kanbanCounts(K.kanbanFilterCards(rows, { projectId: 'p2' }), lanes), {
-    backlog: 0,
-    active: 1,
-    review: 0,
-    blocked: 0,
-    done: 0
-  })
+  const zero = { unfiled: 0, backlog: 0, active: 0, review: 0, blocked: 0, done: 0, canceled: 0 }
+
+  assert.deepEqual(K.kanbanCounts(rows, lanes), { ...zero, active: 2, review: 1 })
+  assert.deepEqual(K.kanbanCounts(K.kanbanFilterCards(rows, { projectId: 'p2' }), lanes), { ...zero, active: 1 })
 })
 
 test('a rename keeps the order and the ids, and an empty label is refused', () => {
@@ -192,12 +212,12 @@ test('a rename keeps the order and the ids, and an empty label is refused', () =
   const renamed = K.renameKanbanLane(lanes, 'review', 'In review')
 
   assert.deepEqual(ids(renamed), DEFAULT_IDS)
-  assert.equal(renamed[2].label, 'In review')
-  assert.deepEqual(renamed.map(lane => lane.order), [0, 1, 2, 3, 4])
+  assert.equal(renamed[3].label, 'In review')
+  assert.deepEqual(renamed.map(lane => lane.order), [0, 1, 2, 3, 4, 5, 6])
 
-  assert.equal(K.renameKanbanLane(renamed, 'review', '   ')[2].label, 'In review')
-  assert.equal(K.renameKanbanLane(renamed, 'someday', 'Nope')[2].label, 'In review')
-  assert.equal(K.renameKanbanLane(renamed, 'review', '  Shipped  ')[2].label, 'Shipped')
+  assert.equal(K.renameKanbanLane(renamed, 'review', '   ')[3].label, 'In review')
+  assert.equal(K.renameKanbanLane(renamed, 'someday', 'Nope')[3].label, 'In review')
+  assert.equal(K.renameKanbanLane(renamed, 'review', '  Shipped  ')[3].label, 'Shipped')
 })
 
 test('a move reorders and renumbers without changing an id, and the ends are no-ops', () => {
@@ -205,25 +225,25 @@ test('a move reorders and renumbers without changing an id, and the ends are no-
 
   const up = K.moveKanbanLane(lanes, 'review', -1)
 
-  assert.deepEqual(ids(up), ['backlog', 'review', 'active', 'blocked', 'done'])
-  assert.deepEqual(up.map(lane => lane.order), [0, 1, 2, 3, 4])
-  assert.deepEqual(K.moveKanbanLane(lanes, 'backlog', -1).map(lane => lane.id), DEFAULT_IDS)
-  assert.deepEqual(K.moveKanbanLane(lanes, 'done', 1).map(lane => lane.id), DEFAULT_IDS)
+  assert.deepEqual(ids(up), ['unfiled', 'backlog', 'review', 'active', 'blocked', 'done', 'canceled'])
+  assert.deepEqual(up.map(lane => lane.order), [0, 1, 2, 3, 4, 5, 6])
+  assert.deepEqual(K.moveKanbanLane(lanes, 'unfiled', -1).map(lane => lane.id), DEFAULT_IDS)
+  assert.deepEqual(K.moveKanbanLane(lanes, 'canceled', 1).map(lane => lane.id), DEFAULT_IDS)
 
   const twice = K.moveKanbanLane(K.moveKanbanLane(lanes, 'blocked', -1), 'blocked', -1)
 
-  assert.deepEqual(ids(twice), ['backlog', 'blocked', 'active', 'review', 'done'])
-  // The stored shape stays {id, label, order}, 0..4, labels carried along.
-  assert.deepEqual(Object.keys(twice[1]).sort(), ['id', 'label', 'order'])
-  assert.equal(twice[1].label, 'Blocked')
+  assert.deepEqual(ids(twice), ['unfiled', 'backlog', 'blocked', 'active', 'review', 'done', 'canceled'])
+  // The stored shape stays {id, label, order}, 0..6, labels carried along.
+  assert.deepEqual(Object.keys(twice[2]).sort(), ['id', 'label', 'order'])
+  assert.equal(twice[2].label, 'Blocked')
 })
 
-test('malformed storage falls back to the five default lanes', () => {
+test('malformed storage falls back to the seven default lanes', () => {
   for (const bad of [null, undefined, 'lanes', 42, {}, [{ id: 'review' }], [{ id: 'nope', label: 'X', order: 0 }]]) {
     const lanes = K.normalizeKanbanLanes(bad)
 
     assert.deepEqual(ids(lanes), DEFAULT_IDS, `input ${JSON.stringify(bad)}`)
-    assert.equal(lanes.length, 5)
+    assert.equal(lanes.length, 7)
   }
 
   // Duplicate orders keep every id and resolve by the default order.
@@ -233,8 +253,8 @@ test('malformed storage falls back to the five default lanes', () => {
   ])
 
   assert.deepEqual(ids(duplicate), DEFAULT_IDS)
-  assert.equal(duplicate[4].label, 'Shipped')
-  assert.deepEqual(duplicate.map(lane => lane.order), [0, 1, 2, 3, 4])
+  assert.equal(duplicate[5].label, 'Shipped')
+  assert.deepEqual(duplicate.map(lane => lane.order), [0, 1, 2, 3, 4, 5, 6])
 })
 
 test('the table sorts by the edited lane order, newest first inside a lane', () => {
@@ -248,7 +268,7 @@ test('the table sorts by the edited lane order, newest first inside a lane', () 
   ]
   const sorted = K.sortKanbanCards(rows, lanes, 1)
 
-  assert.deepEqual(ids(lanes), ['backlog', 'active', 'blocked', 'review', 'done'])
+  assert.deepEqual(ids(lanes), ['unfiled', 'backlog', 'active', 'blocked', 'review', 'done', 'canceled'])
   assert.deepEqual(sorted.map(row => row.title), ['later', 'new', 'old', 'stuck'])
   assert.deepEqual(
     K.sortKanbanCards(rows, lanes, -1).map(row => row.title),
@@ -289,4 +309,84 @@ test('a move builds the session-scoped body the store expects', () => {
     'status',
     'scope'
   ])
+})
+
+test('a linked item derives done or canceled, and an open one derives nothing', () => {
+  // PR: merged is done, closed without a merge is canceled.
+  assert.equal(K.kanbanLaneFor({}, mergedPr, '', null, null).lane, 'done')
+  assert.equal(K.kanbanLaneFor({}, closedPr, '', null, null).lane, 'canceled')
+  // Issue: completed is done, not planned is canceled.
+  assert.equal(K.kanbanLaneFor({}, null, '', null, doneIssue).lane, 'done')
+  assert.equal(K.kanbanLaneFor({}, null, '', null, canceledIssue).lane, 'canceled')
+  // Open PR and open issue prove nothing: the project lane (then unfiled) answers.
+  assert.equal(K.kanbanLaneFor({}, openPr, 'active', null, null).lane, 'active')
+  assert.equal(K.kanbanLaneFor({}, null, 'active', null, openIssue).lane, 'active')
+  assert.equal(K.kanbanLaneFor({}, null, '', null, openIssue).lane, 'unfiled')
+  // An explicit lane the user set still wins over every derivation.
+  const explicit = K.kanbanLaneFor(
+    { status: 'review', status_source: 'user' },
+    mergedPr,
+    'active',
+    null,
+    doneIssue
+  )
+
+  assert.equal(explicit.lane, 'review')
+  assert.equal(explicit.source, 'user')
+})
+
+test('a server lane row carries its system flag through the reader', () => {
+  const rows = K.normalizeLaneTable([
+    { id: 'unfiled', label: 'Unfiled', order: 0, system: 1 },
+    { id: 'triage', label: 'Triage', order: 1, custom: true }
+  ])
+
+  assert.equal(rows[0].system, true)
+  assert.equal(rows[1].system, undefined)
+  assert.equal(rows[1].custom, true)
+})
+
+test('the page has two views and a stored Branches or Issues value lands on Projects', () => {
+  assert.deepEqual(K.VIEW_IDS, ['status', 'projects'])
+  assert.deepEqual(K.VIEWS.map(view => view.label), ['Status', 'Projects'])
+  assert.equal(K.DEFAULT_VIEW, 'projects')
+  assert.equal(K.normalizeView('projects'), 'projects')
+  assert.equal(K.normalizeView('status'), 'status')
+  // The two removed views migrate rather than opening an empty page.
+  assert.equal(K.normalizeView('branches'), 'projects')
+  assert.equal(K.normalizeView(' ISSUES '), 'projects')
+  // A missing or unknown value opens Projects, the default board.
+  assert.equal(K.normalizeView(''), 'projects')
+  assert.equal(K.normalizeView(null), 'projects')
+  assert.equal(K.normalizeView(42), 'projects')
+  assert.equal(K.normalizeView('sessions'), 'projects')
+})
+
+test('the lane filter defaults to every lane checked and is intersected with the live table', () => {
+  const lanes = K.normalizeKanbanLanes([])
+
+  // No stored value means everything is checked.
+  assert.deepEqual(K.normalizeLaneFilter(null, lanes), DEFAULT_IDS)
+  assert.deepEqual(K.normalizeLaneFilter(undefined, lanes), DEFAULT_IDS)
+  // A stored list keeps only live ids, in table order.
+  assert.deepEqual(K.normalizeLaneFilter(['done', 'ghost', 'active'], lanes), ['active', 'done'])
+  // An explicitly empty list is the user's answer: nothing is checked.
+  assert.deepEqual(K.normalizeLaneFilter([], lanes), [])
+  // A lane added after the filter was stored starts checked only when the stored
+  // list names it, so the intersection is the whole rule.
+  assert.deepEqual(K.normalizeLaneFilter(['unfiled', 'canceled'], lanes), ['unfiled', 'canceled'])
+})
+
+test('the filter predicate hides every unchecked lane and nothing else', () => {
+  const selected = ['backlog', 'active']
+
+  assert.equal(K.laneFilterAllows(selected, 'active'), true)
+  assert.equal(K.laneFilterAllows(selected, 'backlog'), true)
+  assert.equal(K.laneFilterAllows(selected, 'review'), false)
+  assert.equal(K.laneFilterAllows(selected, 'canceled'), false)
+  // Case and padding do not change the answer.
+  assert.equal(K.laneFilterAllows(['done'], ' DONE '), true)
+  // A missing or non-list selection hides everything rather than showing all.
+  assert.equal(K.laneFilterAllows(null, 'active'), false)
+  assert.equal(K.laneFilterAllows([], 'active'), false)
 })

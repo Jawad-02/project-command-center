@@ -65,7 +65,7 @@ Each branch row gives you a session, not a chore. Start one in a worktree, or ch
 
 ![Every issue row is a session door](./docs/screenshots/issues.png)
 
-Sessions carry a lane: backlog, active, review, blocked, done. The board summarises them per project, so "who is on review" is a glance instead of a hunt.
+Sessions carry a lane: unfiled, backlog, active, review, blocked, done or canceled. A merged PR or a completed issue lands in done, a closed one in canceled, and a session nothing claims sits in unfiled. The board summarises them per project, so "who is on review" is a glance instead of a hunt.
 
 ## What it never does
 

@@ -207,13 +207,11 @@ def main() -> int:
 
     raw = sqlite3.connect(live)
     try:
-        try:
-            raw.execute("UPDATE link SET status = 'nope' WHERE session_id = 's-old'")
-            raw.commit()
-            refused = False
-        except sqlite3.IntegrityError:
-            refused = True
-        check("the CHECK constraint refuses an unknown lane", refused)
+        schema_sql = " ".join(
+            (raw.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'link'")
+             .fetchone() or [""])[0].split())
+        check("the lane column is no longer a CHECK: lanes are data now",
+              "CHECK (status IN" not in schema_sql, schema_sql[:120])
         try:
             raw.execute("UPDATE link SET status_source = 'nope' WHERE session_id = 's-old'")
             raw.commit()

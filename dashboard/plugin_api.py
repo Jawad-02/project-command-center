@@ -4099,7 +4099,8 @@ def _auto_link(store: Any, session_id: Optional[str]) -> dict[str, Any]:
     else:
         via = "cwd_prefix"
     # The same rule the renderer applies: the session's own lane wins, else the project's.
-    lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None)
+    lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None,
+                              store.lane_ids())
     return {"session_id": session_id or "", "project_id": resolved, "via": via, "cwd": cwd,
             "lane": lane}
 
@@ -4156,6 +4157,68 @@ def board_status(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
                              source="user")
         else:
             _broadcast_board("status", project_id, status=result["status"]["status"], source="user")
+    return result
+
+
+@router.get("/board/lanes")
+def board_lanes() -> dict[str, Any]:
+    """Every lane definition, sorted by position: ``{id, label, order, custom}``.
+
+    Lanes are board data now, not a constant: the Desktop renames, reorders and adds them through
+    the two routes below, and every write path validates against the same table. A broken database
+    is ``ok: false, code: store_error`` with an empty list, like ``/board``.
+    """
+    try:
+        return {"ok": True, "lanes": _board_store().lanes()}
+    except Exception as exc:
+        return _board_failure(exc, lanes=[])
+
+
+@router.post("/board/lanes")
+def board_lane(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Create a lane, or rename and/or move one. Body ``{id?, label, order?}``.
+
+    Without ``id`` the id is a slug of ``label`` (a duplicate is ``code: lane_exists``, a label that
+    cannot yield an id is ``code: bad_label``) and the lane is custom and appended unless ``order``
+    is given. With ``id`` an unknown lane is ``code: unknown_lane``. Always HTTP 200.
+    """
+    try:
+        result = _board_store().save_lane(
+            payload.get("id"), payload.get("label"), payload.get("order"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
+    return result
+
+
+@router.post("/board/lanes/order")
+def board_lanes_order(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Reorder lanes: body ``{ids: [...]}`` must be a permutation of the live ids (else
+    ``code: bad_order``). Positions are rewritten ``0..n-1`` in the order given."""
+    try:
+        result = _board_store().reorder_lanes(payload.get("ids"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
+    return result
+
+
+@router.post("/board/lanes/delete")
+def board_lane_delete(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Delete a lane: body ``{id, reassign?}``.
+
+    The last lane is ``code: last_lane`` and an unknown id is ``code: unknown_lane``. A lane that
+    project statuses or session links still hold is ``code: lane_in_use`` with the counts unless
+    ``reassign`` names another live lane; with it those rows move in the same transaction.
+    """
+    try:
+        result = _board_store().delete_lane(payload.get("id"), payload.get("reassign"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
     return result
 
 

@@ -59,10 +59,10 @@ const ROUTE = '/project-command-center'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
-// The session kanban is a third page, not a tab on the board: it reads the same
-// links but spans every project, which the board's per-project columns cannot.
-const SESSIONS_ROUTE = `${ROUTE}/sessions`
 const QUERY_ROOT = 'project-command-center'
+// The one page has four views; the chosen one is the only route state we keep,
+// because a reload should land where the user left the board.
+const VIEW_KEY = 'ccView.v1'
 const TREE_MS = 15000
 const LIVE_MS = 5000
 const STATUS_KEY = 'projectStatus.v1'
@@ -141,10 +141,16 @@ const SESSION_LANE_SOURCE_TEXT = {
 // Signal first: what a glance at the column should surface.
 const SESSION_LANE_TALLY_ORDER = ['blocked', 'review', 'done', 'active', 'backlog']
 
-function sessionLaneId(value) {
+function sessionLaneId(value, allowed) {
   const id = typeof value === 'string' ? value.trim().toLowerCase() : ''
 
-  return Object.prototype.hasOwnProperty.call(SESSION_LANE_LABELS, id) ? id : ''
+  if (Object.prototype.hasOwnProperty.call(SESSION_LANE_LABELS, id)) return id
+  // The server owns the lane table now, so a caller that read it can name ids
+  // the five constants never had. Without that list the check stays the old
+  // closed set, which is what every older caller passes.
+  if (Array.isArray(allowed) && allowed.includes(id)) return id
+
+  return ''
 }
 
 // A PR row from /github/refs or /github/pr/{n}. Merged is done, open or draft
@@ -159,8 +165,8 @@ function sessionPrLane(pr) {
   return ''
 }
 
-function resolveSessionLane(link, pr, projectLane) {
-  const explicit = sessionLaneId(link && link.status)
+function resolveSessionLane(link, pr, projectLane, allowed) {
+  const explicit = sessionLaneId(link && link.status, allowed)
 
   if (explicit) {
     const raw = String((link && link.status_source) || '').trim().toLowerCase()
@@ -174,7 +180,7 @@ function resolveSessionLane(link, pr, projectLane) {
 
   if (refined) return { lane: refined, note: '', source: 'pr' }
 
-  const project = sessionLaneId(projectLane)
+  const project = sessionLaneId(projectLane, allowed)
 
   if (project) return { lane: project, note: '', source: 'project' }
 
@@ -183,18 +189,18 @@ function resolveSessionLane(link, pr, projectLane) {
 
 function sessionLaneTitle(lane) {
   if (!lane) return ''
-  const label = SESSION_LANE_LABELS[lane.lane] || ''
+  const label = SESSION_LANE_LABELS[lane.lane] || String(lane.lane || '')
   const source = SESSION_LANE_SOURCE_TEXT[lane.source] || SESSION_LANE_SOURCE_TEXT.project
 
   return lane.note ? `${label} lane, ${source}: ${lane.note}` : `${label} lane, ${source}`
 }
 
 // The lookup every surface shares: a link row plus the project's ref map.
-function laneForLink(link, refs, projectLane) {
+function laneForLink(link, refs, projectLane, allowed) {
   const number = Number(link && link.pr)
   const pr = Number.isFinite(number) && number > 0 && refs ? refs.get(number) : null
 
-  return resolveSessionLane(link, pr, projectLane)
+  return resolveSessionLane(link, pr, projectLane, allowed)
 }
 
 // Every session in a project, counted per lane. Linked rows resolve through the
@@ -275,10 +281,202 @@ function kanbanLane(id) {
   return KANBAN_LANE_IDS.includes(value) ? value : ''
 }
 
-// Storage is the only lane shape we do not control. Unknown ids are dropped,
-// missing labels take the default, duplicate or absent orders are renumbered by
-// the default order, and any input that is not a list falls back to the default
-// list, so a malformed write can never leave the board without its five lanes.
+// ── the lane table (server owned) ───────────────────────────────────────────
+// /board/lanes answers the whole table as { id, label, order, custom }. The ids
+// are no longer a closed set of five, so this reader keeps whatever the server
+// names, in the order it names it. The five defaults are only the fallback an
+// older backend (a 404) leaves behind.
+function normalizeLaneTable(raw) {
+  const rows = (Array.isArray(raw) ? raw : []).filter(row => row && typeof row.id === 'string' && row.id.trim())
+  const listed = rows.map((row, index) => {
+    const order = Number(row.order)
+
+    return { row, index, order: Number.isFinite(order) ? order : index }
+  })
+
+  listed.sort((a, b) => a.order - b.order || a.index - b.index)
+  const seen = new Set()
+  const out = []
+
+  for (const entry of listed) {
+    const id = entry.row.id.trim().toLowerCase()
+
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    const label = typeof entry.row.label === 'string' ? entry.row.label.trim() : ''
+    const lane = { id, label: label || SESSION_LANE_LABELS[id] || id, order: out.length }
+
+    if (entry.row.custom === true) lane.custom = true
+    out.push(lane)
+  }
+
+  return out
+}
+
+function laneTableOrDefaults(lanes) {
+  const rows = normalizeLaneTable(lanes)
+
+  return rows.length > 0 ? rows : normalizeKanbanLanes(KANBAN_LANES)
+}
+
+// The server's lane read. Anything that is not the documented shape (a 404
+// body, an older process, an error) yields null, which every caller reads as
+// "no server table, keep the stored copy".
+function laneRowsFromResponse(payload) {
+  if (!payload || typeof payload !== 'object' || payload.ok === false) return null
+  const rows = normalizeLaneTable(payload.lanes)
+
+  return rows.length > 0 ? rows : null
+}
+
+function laneIds(lanes) {
+  return normalizeLaneTable(lanes).map(lane => lane.id)
+}
+
+// A card in a lane the table no longer lists sits in the first lane: a column
+// that exists beats a card that renders nowhere.
+function lanePlace(lanes, id) {
+  const rows = normalizeLaneTable(lanes)
+  const value = typeof id === 'string' ? id.trim().toLowerCase() : ''
+
+  if (rows.some(lane => lane.id === value)) return value
+
+  return rows.length > 0 ? rows[0].id : 'backlog'
+}
+
+// The list-level form of the rule above, applied after the filters so a placed
+// card still counts in its column.
+function kanbanPlaceCards(cards, lanes) {
+  return (cards || []).map(card => {
+    if (!card) return card
+    const lane = lanePlace(lanes, card.lane)
+
+    return lane === card.lane ? card : { ...card, lane }
+  })
+}
+
+// What the create route would slug the label into; the optimistic column has to
+// carry the same key a reload will show.
+function laneSlug(label) {
+  return String(label == null ? '' : label)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+}
+
+// Request bodies, in one place so the suite can assert them without a request.
+function laneCreateBody(label) {
+  return { label: String(label == null ? '' : label).trim() }
+}
+
+function laneRenameBody(id, label) {
+  return { id: String(id), label: String(label == null ? '' : label).trim() }
+}
+
+function laneDeleteBody(id, reassign) {
+  const body = { id: String(id) }
+  const target = typeof reassign === 'string' ? reassign.trim() : ''
+
+  if (target) body.reassign = target
+
+  return body
+}
+
+function laneOrderBody(lanes) {
+  return { ids: laneIds(lanes) }
+}
+
+// Optimistic create: the server owns the id, so the local copy mirrors its slug
+// rule and a collision gets the same numeric suffix a second create would.
+function addKanbanLane(lanes, label) {
+  const text = String(label == null ? '' : label).trim()
+  const rows = laneTableOrDefaults(lanes)
+  const base = laneSlug(text)
+
+  if (!text || !base) return rows
+
+  let id = base
+  let n = 2
+
+  while (rows.some(lane => lane.id === id)) {
+    id = `${base}-${n}`
+    n += 1
+  }
+
+  return [...rows, { id, label: text, order: rows.length, custom: true }]
+}
+
+// The order route answers ids; the local table reorders by them, keeping every
+// lane it did not hear about at the end.
+function mergeKanbanOrder(lanes, ids) {
+  const rows = laneTableOrDefaults(lanes)
+  const wanted = Array.isArray(ids) ? ids.map(id => String(id)) : []
+  const out = []
+
+  for (const id of wanted) {
+    const row = rows.find(lane => lane.id === id)
+
+    if (row && !out.includes(row)) out.push(row)
+  }
+
+  for (const row of rows) if (!out.includes(row)) out.push(row)
+
+  return out.map((row, index) => ({ ...row, order: index }))
+}
+
+// The five default lanes keep their theme colour; a custom lane cycles the same
+// palette by its position, so every column has a dot.
+const KANBAN_CUSTOM_VARS = [
+  'var(--ui-accent)',
+  'var(--ui-purple)',
+  'var(--ui-green)',
+  'var(--ui-red)',
+  'var(--ui-text-quaternary)'
+]
+
+function laneColor(id, lanes) {
+  if (SESSION_LANE_VARS[id]) return SESSION_LANE_VARS[id]
+  const index = laneIds(lanes).indexOf(String(id))
+
+  return index >= 0 ? KANBAN_CUSTOM_VARS[index % KANBAN_CUSTOM_VARS.length] : 'var(--ui-text-quaternary)'
+}
+
+function laneLabel(id, lanes) {
+  const row = normalizeLaneTable(lanes).find(lane => lane.id === id)
+
+  if (row) return row.label
+
+  return SESSION_LANE_LABELS[id] || (id ? String(id) : '')
+}
+
+// The lane_in_use refusal carries how many cards sit in the lane. The key has
+// moved shape once, so a bare number, a per-lane map and a totals object all
+// read here.
+function laneUseCount(counts, id) {
+  if (counts == null) return 0
+  if (Number.isFinite(Number(counts)) && typeof counts !== 'object') return Number(counts)
+  if (typeof counts !== 'object') return 0
+  const row = counts[id]
+
+  if (Number.isFinite(Number(row)) && typeof row !== 'object') return Number(row)
+  if (row && typeof row === 'object') {
+    const n = Number(row.count ?? row.sessions ?? row.total)
+
+    if (Number.isFinite(n)) return n
+  }
+
+  const total = Number(counts.total ?? counts.count ?? counts.sessions)
+
+  return Number.isFinite(total) ? total : 0
+}
+
+// The five defaults, and the shape a stored copy had before the server owned the
+// table. Unknown ids are dropped, missing labels take the default, duplicate or
+// absent orders are renumbered by the default order, and any input that is not a
+// list falls back to the default list, so the fallback can never leave the board
+// without its five lanes.
 function normalizeKanbanLanes(raw) {
   const rows = Array.isArray(raw) ? raw : []
   const out = []
@@ -309,17 +507,18 @@ function normalizeKanbanLanes(raw) {
 // A rename keeps the lane where it is; an empty label keeps the old one.
 function renameKanbanLane(lanes, id, label) {
   const text = typeof label === 'string' ? label.trim() : ''
-  const lane = kanbanLane(id)
+  const rows = laneTableOrDefaults(lanes)
+  const lane = typeof id === 'string' ? id.trim().toLowerCase() : ''
 
-  if (!lane) return normalizeKanbanLanes(lanes)
+  if (!text || !lane || !rows.some(row => row.id === lane)) return rows
 
-  return normalizeKanbanLanes(lanes).map(row => (row.id === lane && text ? { ...row, label: text } : row))
+  return rows.map(row => (row.id === lane ? { ...row, label: text } : row))
 }
 
 // One step up (delta < 0) or down; a move past either end is a no-op.
 function moveKanbanLane(lanes, id, delta) {
-  const list = normalizeKanbanLanes(lanes)
-  const lane = kanbanLane(id)
+  const list = laneTableOrDefaults(lanes)
+  const lane = typeof id === 'string' ? id.trim().toLowerCase() : ''
   const from = list.findIndex(row => row.id === lane)
   const step = Number(delta) < 0 ? -1 : 1
   const to = from + step
@@ -333,9 +532,18 @@ function moveKanbanLane(lanes, id, delta) {
 }
 
 // The page's one lane lookup. A card with nothing set anywhere still has to sit
-// in a column, so it lands in backlog and reads as unset.
-function kanbanLaneFor(link, pr, projectLane) {
-  return resolveSessionLane(link, pr, projectLane) || { lane: 'backlog', note: '', source: 'unset' }
+// in a column, so it lands in the first lane and reads as unset. An explicit
+// lane id that the server table no longer lists lands in the first lane too,
+// which is the whole point of resolving against the table and not a constant.
+function kanbanLaneFor(link, pr, projectLane, lanes) {
+  const rows = normalizeLaneTable(lanes)
+  const ids = rows.map(row => row.id)
+  const resolved = resolveSessionLane(link, pr, projectLane, ids)
+
+  if (!resolved) return { lane: ids[0] || 'backlog', note: '', source: 'unset' }
+  if (ids.length > 0 && !ids.includes(resolved.lane)) return { ...resolved, lane: ids[0] }
+
+  return resolved
 }
 
 // Filters compose: project, source, stale and search all have to pass. Search is
@@ -372,7 +580,7 @@ function kanbanFilterCards(cards, filters) {
 function kanbanCounts(cards, lanes) {
   const counts = {}
 
-  for (const lane of normalizeKanbanLanes(lanes)) counts[lane.id] = 0
+  for (const lane of normalizeLaneTable(lanes)) counts[lane.id] = 0
   for (const card of cards || []) if (card && counts[card.lane] != null) counts[card.lane] += 1
 
   return counts
@@ -380,7 +588,7 @@ function kanbanCounts(cards, lanes) {
 
 // The table is grouped by the user's lane order, newest first inside a lane.
 function sortKanbanCards(cards, lanes, direction) {
-  const rank = new Map(normalizeKanbanLanes(lanes).map((row, index) => [row.id, index]))
+  const rank = new Map(normalizeLaneTable(lanes).map((row, index) => [row.id, index]))
   const dir = Number(direction) < 0 ? -1 : 1
 
   return (cards || []).slice().sort((a, b) => {
@@ -398,6 +606,114 @@ function kanbanMoveBody(projectId, sessionId, status) {
   return { project_id: projectId, session_id: sessionId, status, scope: 'session' }
 }
 // session-kanban:end
+
+// merged-views:begin
+// The plugin's one page renders four views over the same session cards. This is
+// the pure half: the view ids and their storage value, the branch and issue
+// groupings, and the row shape the project page's session list already renders.
+// No imports, no JSX and no storage, so the node suite can slice it out.
+
+const VIEWS = [
+  { id: 'status', label: 'Status' },
+  { id: 'projects', label: 'Projects' },
+  { id: 'branches', label: 'Branches' },
+  { id: 'issues', label: 'Issues' }
+]
+const DEFAULT_VIEW = 'status'
+const VIEW_IDS = VIEWS.map(view => view.id)
+
+function normalizeView(value) {
+  const id = typeof value === 'string' ? value.trim().toLowerCase() : ''
+
+  return VIEW_IDS.includes(id) ? id : DEFAULT_VIEW
+}
+
+// Newest first inside a group, the same order the project page's lane rows use.
+function sortViewCards(cards) {
+  return (cards || [])
+    .slice()
+    .sort((a, b) => (Number(b && b.lastActivity) || 0) - (Number(a && a.lastActivity) || 0))
+}
+
+// Branches span projects, so the group is the branch name alone; the biggest
+// group leads, and a tie falls back to the name.
+function kanbanBranchGroups(cards) {
+  const map = new Map()
+
+  for (const card of cards || []) {
+    if (!card) continue
+    const branch = String(card.branch || '').trim() || 'main'
+    const rows = map.get(branch) || []
+
+    rows.push(card)
+    map.set(branch, rows)
+  }
+
+  return Array.from(map.entries())
+    .map(([branch, rows]) => ({ key: `branch:${branch}`, id: branch, label: branch, cards: sortViewCards(rows) }))
+    .sort((a, b) => b.cards.length - a.cards.length || a.label.localeCompare(b.label))
+}
+
+// The five buckets a session's refs can land in. A merged PR outranks its closed
+// state, an open PR is in review, an issue with no PR is open, and a session
+// with neither is unlinked. The order is the display order.
+const ISSUE_STATES = [
+  { id: 'open', label: 'Open', icon: 'issues' },
+  { id: 'review', label: 'In review', icon: 'git-pull-request' },
+  { id: 'merged', label: 'Merged', icon: 'git-merge' },
+  { id: 'closed', label: 'Closed', icon: 'circle-slash' },
+  { id: 'unlinked', label: 'Unlinked', icon: 'link' }
+]
+
+function kanbanIssueState(card) {
+  if (!card) return 'unlinked'
+  const pr = card.prState && typeof card.prState === 'object' ? card.prState : null
+
+  if (pr) {
+    const state = String(pr.state || '').trim().toLowerCase()
+
+    if (pr.merged === true || state === 'merged') return 'merged'
+    if (state === 'open') return 'review'
+    if (state === 'closed') return 'closed'
+  }
+
+  if (Number(card.pr) > 0) return 'review'
+  if (Number(card.issue) > 0) return 'open'
+
+  return 'unlinked'
+}
+
+function kanbanIssueGroups(cards) {
+  const rows = cards || []
+
+  return ISSUE_STATES.map(state => ({
+    key: `issue:${state.id}`,
+    id: state.id,
+    label: state.label,
+    icon: state.icon,
+    cards: sortViewCards(rows.filter(card => card && kanbanIssueState(card) === state.id))
+  }))
+}
+
+// The project page's session row reads a gateway session; a kanban card carries
+// the same title, id and activity stamp under other names, so the merged views
+// hand it one without a second fetch.
+function cardAsSession(card) {
+  const row = card || {}
+
+  return {
+    id: String(row.sessionId || row.id || ''),
+    title: String(row.title || ''),
+    last_active: Number(row.lastActivity) || 0
+  }
+}
+
+function cardLane(card) {
+  const row = card || {}
+
+  return { lane: row.lane, note: row.laneNote || '', source: row.laneSource || 'unset' }
+}
+// merged-views:end
 
 const LIVE_LABELS = {
   idle: 'Idle',
@@ -562,13 +878,16 @@ function writeStatus(projectId, status) {
   boardRest('/board/status', { method: 'POST', body: { project_id: projectId, status } }).catch(() => {})
 }
 
-// Lane labels and order belong to the user, but the ids belong to the store, so
-// the read path never trusts storage: a missing key or a hand-edited value comes
-// back as the constant default.
+// The lane table is server owned now (/board/lanes), so the stored copy is a
+// read-through cache: it answers while the read is in flight and it is what an
+// older backend (a 404) leaves in charge. A stored table with any lane in it is
+// kept as-is, custom ids included; a missing or unreadable one is the five
+// defaults.
 function readLanes() {
   const raw = pluginCtx ? pluginCtx.storage.get(LANES_KEY, null) : null
+  const rows = normalizeLaneTable(raw)
 
-  return normalizeKanbanLanes(raw)
+  return rows.length > 0 ? rows : normalizeKanbanLanes(KANBAN_LANES)
 }
 
 function saveLanes(next) {
@@ -576,17 +895,211 @@ function saveLanes(next) {
 }
 
 function writeLanes(next) {
-  const rows = normalizeKanbanLanes(next)
+  const rows = normalizeLaneTable(next)
+  const value = rows.length > 0 ? rows : normalizeKanbanLanes(KANBAN_LANES)
 
-  $lanes.set(rows)
-  saveLanes(rows)
+  $lanes.set(value)
+  saveLanes(value)
+}
+
+// One lane read shared by the status page and the project detail page. A 404
+// (or any failure) leaves the stored copy in charge, which is exactly the older
+// backend's five defaults; the page never blocks on the route.
+function useLaneTable() {
+  const query = useQuery({
+    queryFn: () => boardRest('/board/lanes'),
+    queryKey: [QUERY_ROOT, 'lanes'],
+    refetchInterval: BOARD_MS,
+    retry: false,
+    staleTime: 10000
+  })
+
+  const local = useValue($lanes)
+  const serverRows = useMemo(() => laneRowsFromResponse(query.data), [query.data])
+
+  // Server truth is this machine's restart copy too, so the next launch (or an
+  // offline read) starts from the table the server last named.
+  useEffect(() => {
+    if (!serverRows) return
+    if (JSON.stringify($lanes.get()) === JSON.stringify(serverRows)) return
+
+    $lanes.set(serverRows)
+    saveLanes(serverRows)
+  }, [serverRows])
+
+  return { live: Boolean(serverRows), query, rows: serverRows || local }
+}
+
+// A failed lane write and its reason. `code` is the route's own code, and
+// `counts` only rides a lane_in_use refusal.
+function laneFailure(res) {
+  const code = String((res && res.code) || '')
+  const text =
+    res && typeof res.error === 'string' && res.error.trim()
+      ? res.error.trim()
+      : {
+          bad_label: 'Give the lane a name.',
+          lane_exists: 'A lane with that name already exists.',
+          unknown_lane: 'That lane is no longer on the board.',
+          bad_order: 'The board refused that lane order.',
+          lane_in_use: 'That lane still has sessions.',
+          last_lane: 'The board needs at least one lane.'
+        }[code] || 'The board refused the lane change.'
+  const err = new Error(text)
+
+  err.code = code
+  err.counts = res && res.counts
+
+  return err
+}
+
+function lanePost(path, body) {
+  return boardRest(path, { method: 'POST', body }).then(res => {
+    if (!res || res.ok === false) throw laneFailure(res)
+
+    return res
+  })
+}
+
+function laneRefresh() {
+  queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'lanes'] })
+}
+
+// A local override that names a lane the server just removed would outlive the
+// board answer for its TTL and hide the cards' new lane, so the delete clears
+// those overrides and lets the reread place every card.
+function forgetSessionLane(laneId) {
+  const rows = $sessionStatus.get()
+  const next = {}
+  let changed = false
+
+  for (const [id, row] of Object.entries(rows)) {
+    if (row && row.status === laneId) {
+      changed = true
+
+      continue
+    }
+
+    next[id] = row
+  }
+
+  if (changed) $sessionStatus.set(next)
+}
+
+// Deleting a lane moves its cards on the server, so the board has to be reread
+// the moment the request settles: the lanes query alone would leave the cards
+// on a column that is gone.
+function laneRefreshBoard() {
+  laneRefresh()
+  queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
+}
+
+function laneToast(err, action) {
+  host.notify({
+    kind: 'warning',
+    message: `Could not ${action}: ${(err && err.message) || 'the board did not answer'}`
+  })
+}
+
+// Create: the column appears before the POST is answered. A refusal puts the
+// table back and says why, and the caller may also show the reason inline.
+function createLane(label) {
+  const text = String(label == null ? '' : label).trim()
+
+  if (!text) return Promise.reject(laneFailure({ code: 'bad_label' }))
+  const snapshot = $lanes.get()
+
+  writeLanes(addKanbanLane(snapshot, text))
+
+  return lanePost('/board/lanes', laneCreateBody(text))
+    .then(res => {
+      laneRefresh()
+
+      return res
+    })
+    .catch(err => {
+      writeLanes(snapshot)
+      laneRefresh()
+      laneToast(err, `add the ${text} lane`)
+      throw err
+    })
+}
+
+function renameLane(laneId, label) {
+  const text = String(label == null ? '' : label).trim()
+  const snapshot = $lanes.get()
+  const next = renameKanbanLane(snapshot, laneId, text)
+
+  if (!text || JSON.stringify(next) === JSON.stringify(normalizeLaneTable(snapshot))) return Promise.resolve()
+
+  writeLanes(next)
+
+  return lanePost('/board/lanes', laneRenameBody(laneId, text))
+    .then(res => {
+      laneRefresh()
+
+      return res
+    })
+    .catch(err => {
+      writeLanes(snapshot)
+      laneRefresh()
+      laneToast(err, 'rename that lane')
+      throw err
+    })
+}
+
+function reorderLanes(lanes) {
+  const snapshot = $lanes.get()
+  const next = normalizeLaneTable(lanes)
+
+  writeLanes(next)
+
+  return lanePost('/board/lanes/order', laneOrderBody(next))
+    .then(res => {
+      laneRefresh()
+
+      return res
+    })
+    .catch(err => {
+      writeLanes(snapshot)
+      laneRefresh()
+      laneToast(err, 'reorder the lanes')
+      throw err
+    })
+}
+
+// Delete, with the lane_in_use retry: without `reassign` the server refuses and
+// reports the card counts; the popover then asks where the cards should go and
+// calls this again with the chosen lane.
+function deleteLane(laneId, reassign) {
+  const snapshot = $lanes.get()
+  const target = typeof reassign === 'string' ? reassign.trim() : ''
+
+  if (!target) writeLanes(normalizeLaneTable(snapshot).filter(row => row.id !== laneId))
+
+  return lanePost('/board/lanes/delete', laneDeleteBody(laneId, target))
+    .then(res => {
+      forgetSessionLane(laneId)
+      laneRefreshBoard()
+
+      return res
+    })
+    .catch(err => {
+      writeLanes(snapshot)
+      laneRefreshBoard()
+      if (!err || err.code !== 'lane_in_use') laneToast(err, 'remove that lane')
+      throw err
+    })
 }
 
 // A card moves before the POST is answered; a refusal puts it back and says why.
 // The board read is invalidated either way, so the server copy wins as soon as
 // it lands.
 function writeSessionLane(projectId, sessionId, status) {
-  const lane = kanbanLane(status)
+  // The lane must be one the table currently lists; a custom lane is as real as
+  // a default one, and a lane that was just deleted is refused here the same way
+  // the server would refuse it.
+  const lane = laneIdIn($lanes.get(), status)
 
   if (!projectId || !sessionId || !lane) return
   const at = Date.now()
@@ -612,7 +1125,7 @@ function writeSessionLane(projectId, sessionId, status) {
       queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
       host.notify({
         kind: 'warning',
-        message: `Could not move this session to ${SESSION_LANE_LABELS[lane]}: ${(err && err.message) || 'the board did not answer'}`
+        message: `Could not move this session to ${laneLabel(lane, $lanes.get())}: ${(err && err.message) || 'the board did not answer'}`
       })
     })
 }
@@ -924,6 +1437,32 @@ function writeSort(sortId) {
   if (pluginCtx) pluginCtx.storage.set(SORT_KEY, sortId)
 }
 
+// ── view storage ─────────────────────────────────────────────────────────────
+// One page, four views. The atom is the render path and storage is the durable
+// copy, so a reload (or a revisit from the sidebar) lands on the last view.
+
+const $view = atom(DEFAULT_VIEW)
+
+function readView() {
+  const raw = pluginCtx ? pluginCtx.storage.get(VIEW_KEY, DEFAULT_VIEW) : DEFAULT_VIEW
+
+  return normalizeView(raw)
+}
+
+function writeView(viewId) {
+  const id = normalizeView(viewId)
+
+  $view.set(id)
+  if (pluginCtx) pluginCtx.storage.set(VIEW_KEY, id)
+}
+
+// A palette entry and a nav click both land here: pick the view, then make sure
+// the single route is the one showing it.
+function openView(viewId) {
+  writeView(viewId)
+  host.navigate(ROUTE)
+}
+
 // ── open project storage ─────────────────────────────────────────────────────
 // Same discipline as status/sort: the atom is the render path, storage is the
 // durable copy. The detail route has no params, so it reads this on mount.
@@ -1194,6 +1733,21 @@ const CSS_TEXT = `
 const S = {
   page: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden' },
   header: { display: 'flex', alignItems: 'center', gap: 12, padding: '14px 20px 10px', flex: 'none', flexWrap: 'wrap' },
+  // The merged page renders the chosen view under one header: the view keeps
+  // its own toolbar row, but not its own page frame or title.
+  viewBody: { display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' },
+  viewBar: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 20px 10px', flex: 'none', flexWrap: 'wrap' },
+  viewSwitch: { display: 'inline-flex', flex: 'none' },
+  groupList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+    padding: '0 20px 16px',
+    overflow: 'auto',
+    flex: '1 1 0',
+    minHeight: 0
+  },
+  panelBoard: { display: 'flex', flex: '1 1 0', minHeight: 240, maxHeight: 520, minWidth: 0 },
   title: { margin: 0, fontSize: '1rem', fontWeight: 600, color: 'var(--ui-text-primary)', lineHeight: 1.2 },
   count: { fontSize: '0.75rem', color: 'var(--ui-text-quaternary)', fontVariantNumeric: 'tabular-nums' },
   grow: { flex: '1 1 0', minWidth: 0 },
@@ -2206,6 +2760,8 @@ const S = {
     border: '1px solid color-mix(in srgb, var(--ui-purple) 35%, transparent)'
   },
   lanesPop: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 250 },
+  laneCol: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  laneError: { fontSize: '0.6875rem', lineHeight: 1.4, color: 'var(--ui-red)', padding: '2px 2px 0' },
   laneRow: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
   laneInput: {
     flex: '1 1 0',
@@ -2363,9 +2919,9 @@ function LiveDot({ state }) {
 
 // Read-only on purpose: the plugin owns no per-session status control, so the
 // badge names the lane and where it came from instead of opening an editor.
-function LaneBadge({ lane }) {
+function LaneBadge({ lane, lanes }) {
   if (!lane) return null
-  const label = SESSION_LANE_LABELS[lane.lane]
+  const label = laneLabel(lane.lane, lanes)
 
   if (!label) return null
   const title = sessionLaneTitle(lane)
@@ -2377,7 +2933,7 @@ function LaneBadge({ lane }) {
       className: 'pcc-lane',
       style: S.laneBadge,
       children: [
-        jsx('span', { 'aria-hidden': 'true', style: { ...S.laneDot, background: SESSION_LANE_VARS[lane.lane] } }),
+        jsx('span', { 'aria-hidden': 'true', style: { ...S.laneDot, background: laneColor(lane.lane, lanes) } }),
         label
       ]
     })
@@ -7182,7 +7738,7 @@ function laneGroups(node) {
   return out
 }
 
-function DetailSessionRow({ session, state, onOpen, lane }) {
+function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
   const running = RUNNING.has(state)
@@ -7201,12 +7757,13 @@ function DetailSessionRow({ session, state, onOpen, lane }) {
         children: [
           state && state !== 'idle' ? jsx('span', { style: { display: 'inline-flex', flex: 'none' }, children: jsx(LiveDot, { state }) }) : null,
           jsx('span', { style: S.laneRowTitle, children: sessionTitle(session) }),
-          lane ? jsx('span', { style: { display: 'inline-flex', flex: 'none', marginLeft: 'auto' }, children: jsx(LaneBadge, { lane }) }) : null
+          lane ? jsx('span', { style: { display: 'inline-flex', flex: 'none', marginLeft: 'auto' }, children: jsx(LaneBadge, { lane, lanes }) }) : null
         ]
       }),
       jsxs('span', {
         style: S.laneRowMeta,
         children: [
+          projectLabel ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: projectLabel }) : null,
           ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ageText(ms) }) }) : null,
           model ? jsx('span', { children: model }) : null,
           messages ? jsx('span', { children: `${messages} ${messages === 1 ? 'message' : 'messages'}` }) : null,
@@ -7242,6 +7799,11 @@ function ProjectDetailPage() {
   const projectId = useValue($openProject)
   const statuses = useValue($statuses)
   const [spin, setSpin] = useState(false)
+  // The session panel groups by branch (its original layout) or by the kanban's
+  // lane columns, scoped to this project.
+  const [panelMode, setPanelMode] = useState('branch')
+  const [panelDrag, setPanelDrag] = useState(null)
+  const [panelDropLane, setPanelDropLane] = useState('')
 
   const tree = useQuery({
     queryFn: () => host.request('projects.tree', { preview_limit: 5, ...profileParam() }),
@@ -7286,6 +7848,68 @@ function ProjectDetailPage() {
     id => laneForLink(linkBySession.get(id), projectRefs, projectLane),
     [linkBySession, projectRefs, projectLane]
   )
+
+  // The lane mode of the panel: the same kanban the Status view renders, but
+  // built from this project's session rows instead of session.list, and scoped
+  // to the project's id so a move posts the right scope.
+  const laneState = useLaneTable()
+  const laneRows = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const panelCards = useMemo(() => {
+    const now = Date.now()
+    const out = []
+    const seen = new Set()
+
+    for (const group of lanes) {
+      for (const s of group.sessions || []) {
+        if (!s || !s.id || seen.has(s.id)) continue
+        seen.add(s.id)
+        const link = linkBySession.get(s.id) || null
+        const number = Number(link && link.pr)
+        const pr = projectRefs && Number.isFinite(number) && number > 0 ? projectRefs.get(number) || null : null
+
+        out.push(
+          buildKanbanCard({
+            session: s,
+            link,
+            project,
+            projectId: project ? project.id : projectId,
+            pr,
+            projectLane,
+            branch: String(s.git_branch || '').trim() || 'main',
+            now,
+            lanes: laneRows
+          })
+        )
+      }
+    }
+
+    return kanbanPlaceCards(out, laneRows)
+  }, [lanes, linkBySession, projectRefs, project, projectId, projectLane, laneRows])
+  const panelCounts = useMemo(() => kanbanCounts(panelCards, laneRows), [panelCards, laneRows])
+  const panelByLane = useMemo(() => {
+    const map = new Map(laneRows.map(lane => [lane.id, []]))
+
+    for (const card of panelCards) {
+      const list = map.get(card.lane)
+
+      if (list) list.push(card)
+    }
+
+    for (const list of map.values()) list.sort((a, b) => b.lastActivity - a.lastActivity)
+
+    return map
+  }, [panelCards, laneRows])
+  const panelMove = (card, status) => {
+    if (!card || !card.projectId || !card.sessionId || card.lane === status) return
+    writeSessionLane(card.projectId, card.sessionId, status)
+  }
+  const panelDrop = laneId => {
+    const card = panelDrag
+
+    setPanelDrag(null)
+    setPanelDropLane('')
+    if (card && laneId) panelMove(card, laneId)
+  }
 
   // The header names the work tree a vault subfolder really belongs to. Same
   // queryKey as the GitHub section's read, so react-query answers both with one
@@ -7498,10 +8122,36 @@ function ProjectDetailPage() {
                   jsx('span', { style: S.stripTitle, children: 'Sessions by lane' }),
                   detail.isFetching ? jsx(Codicon, { name: 'loading', size: '0.75rem', spinning: true }) : null,
                   jsx('span', { style: S.grow }),
+                  jsx(SegmentedControl, { onChange: setPanelMode, options: PANEL_MODES, sizing: 'content', value: panelMode }),
                   jsx('span', { style: S.count, children: loadedCount })
                 ]
               }),
-              lanes.length === 0
+              panelMode === 'lane'
+                ? jsx('div', {
+                    style: S.panelBoard,
+                    children: jsx(KanbanViews, {
+                      byLane: panelByLane,
+                      counts: panelCounts,
+                      direction: 1,
+                      dragCard: panelDrag,
+                      dropLane: panelDropLane,
+                      lanes: laneRows,
+                      onDragEnd: () => {
+                        setPanelDrag(null)
+                        setPanelDropLane('')
+                      },
+                      onDragOver: setPanelDropLane,
+                      onDragStart: setPanelDrag,
+                      onDrop: panelDrop,
+                      onMove: panelMove,
+                      onOpenProject: openProject,
+                      onOpenSession: openSession,
+                      onSortLane: () => {},
+                      states: live.byStored,
+                      view: 'kanban'
+                    })
+                  })
+                : lanes.length === 0
                 ? jsx('div', { style: S.quiet, children: detail.isLoading ? 'Loading sessions...' : 'No sessions in this project yet' })
                 : lanes.map(group => {
                     const branch =
@@ -7568,7 +8218,7 @@ function matchesQuery(project, q) {
   return hay.some(v => v && String(v).toLowerCase().includes(q))
 }
 
-function ProjectsPage() {
+function ProjectsPage({ embedded }) {
   const [search, setSearch] = useState('')
   const statuses = useValue($statuses)
 
@@ -7693,13 +8343,13 @@ function ProjectsPage() {
   }
 
   return jsxs('div', {
-    style: S.page,
+    style: embedded ? S.viewBody : S.page,
     children: [
-      jsx('style', { children: CSS_TEXT }),
-      jsxs('header', {
-        style: S.header,
+      embedded ? null : jsx('style', { children: CSS_TEXT }),
+      jsxs(embedded ? 'div' : 'header', {
+        style: embedded ? S.viewBar : S.header,
         children: [
-          jsx('h1', { style: S.title, children: 'Projects' }),
+          embedded ? null : jsx('h1', { style: S.title, children: 'Projects' }),
           jsx('span', { style: S.count, children: tree.data ? `${countLabel} ${projects.length === 1 && !q ? 'project' : 'projects'}` : '' }),
           jsx('span', { style: S.grow }),
           jsx(SortPicker, { sort: sortId }),
@@ -7747,6 +8397,11 @@ const EMPTY_BRANCHES = {}
 const KANBAN_VIEWS = [
   { id: 'kanban', label: 'Kanban' },
   { id: 'table', label: 'Table' }
+]
+// The project page's session panel: its own grouping, or the kanban columns.
+const PANEL_MODES = [
+  { id: 'branch', label: 'By branch' },
+  { id: 'lane', label: 'By lane' }
 ]
 const KANBAN_SOURCE_FILTERS = [
   { value: '', label: 'Any source' },
@@ -7799,10 +8454,10 @@ function buildKanbanCard(input) {
   const session = source.session || {}
   const link = source.link || null
   const project = source.project || null
-  const projectId = String((link && link.project_id) || '')
+  const projectId = String(source.projectId || (link && link.project_id) || '')
   const rawIssue = Number(link && link.issue)
   const rawPr = Number(link && link.pr)
-  const lane = kanbanLaneFor(link, source.pr || null, source.projectLane)
+  const lane = kanbanLaneFor(link, source.pr || null, source.projectLane, source.lanes)
   const started = stampMs(session.started_at)
   const updated = stampMs(link && link.status_updated_at)
   const lastActivity = Math.max(started, updated)
@@ -7843,20 +8498,37 @@ function KanbanSelect({ ariaLabel, disabled, onChange, options, style, value }) 
   })
 }
 
-function LaneEditorRow({ index, lanes, lane, total }) {
+function LaneEditorRow({ index, lanes, lane, live, onRemove, total }) {
   const [draft, setDraft] = useState(lane.label)
 
   useEffect(() => setDraft(lane.label), [lane.label])
 
   const commit = () => {
-    if (draft.trim() && draft.trim() !== lane.label) writeLanes(renameKanbanLane(lanes, lane.id, draft))
-    else if (!draft.trim()) setDraft(lane.label)
+    const text = draft.trim()
+
+    if (!text) {
+      setDraft(lane.label)
+
+      return
+    }
+
+    if (text === lane.label) return
+
+    if (live) renameLane(lane.id, text).catch(() => {})
+    else writeLanes(renameKanbanLane(lanes, lane.id, text))
+  }
+
+  const move = delta => {
+    const next = moveKanbanLane(lanes, lane.id, delta)
+
+    if (live) reorderLanes(next).catch(() => {})
+    else writeLanes(next)
   }
 
   return jsxs('div', {
     style: S.laneRow,
     children: [
-      jsx('span', { 'aria-hidden': 'true', style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] } }),
+      jsx('span', { 'aria-hidden': 'true', style: { ...S.kdot, marginTop: 0, background: laneColor(lane.id, lanes) } }),
       jsx('input', {
         'aria-label': `${lane.label} lane label`,
         onBlur: commit,
@@ -7875,12 +8547,13 @@ function LaneEditorRow({ index, lanes, lane, total }) {
         style: S.laneInput,
         value: draft
       }),
+      lane.custom ? jsx(Badge, { size: 'xs', variant: 'outline', children: 'custom' }) : null,
       jsx(Tip, {
         label: `Move ${lane.label} up`,
         children: jsx(Button, {
           'aria-label': `Move ${lane.label} lane up`,
           disabled: index === 0,
-          onClick: () => writeLanes(moveKanbanLane(lanes, lane.id, -1)),
+          onClick: () => move(-1),
           size: 'icon-xs',
           variant: 'ghost',
           children: jsx(Codicon, { name: 'arrow-up', size: '0.75rem' })
@@ -7891,27 +8564,82 @@ function LaneEditorRow({ index, lanes, lane, total }) {
         children: jsx(Button, {
           'aria-label': `Move ${lane.label} lane down`,
           disabled: index === total - 1,
-          onClick: () => writeLanes(moveKanbanLane(lanes, lane.id, 1)),
+          onClick: () => move(1),
           size: 'icon-xs',
           variant: 'ghost',
           children: jsx(Codicon, { name: 'arrow-down', size: '0.75rem' })
+        })
+      }),
+      jsx(Tip, {
+        label: total <= 1 ? 'The board needs at least one lane' : `Remove ${lane.label}`,
+        children: jsx(Button, {
+          'aria-label': `Remove ${lane.label} lane`,
+          disabled: !live || total <= 1,
+          onClick: () => onRemove(lane),
+          size: 'icon-xs',
+          variant: 'ghost',
+          children: jsx(Codicon, { name: 'trash', size: '0.75rem' })
         })
       })
     ]
   })
 }
 
-// Labels and order only; adding or removing a lane would change the store's five
-// ids, which this phase does not do.
-function LanesPopover({ lanes }) {
-  const rows = normalizeKanbanLanes(lanes)
+// The lane table's one editor: rename, reorder, add and remove. Every write is
+// optimistic through the helpers above and comes back to the server copy
+// (invalidate lanes, and the board when a delete moves cards). With no lane
+// route answering, the controls keep the old local-only behaviour.
+function LanesPopover({ lanes, live }) {
+  const rows = laneTableOrDefaults(lanes)
+  const [draft, setDraft] = useState('')
+  const [error, setError] = useState('')
+  const [pending, setPending] = useState(null)
+  const [target, setTarget] = useState('')
+
+  const add = () => {
+    const text = draft.trim()
+
+    if (!text || !live) return
+    setDraft('')
+    setError('')
+    createLane(text).catch(err => setError(String((err && err.message) || 'The board refused the lane.')))
+  }
+
+  const remove = lane => {
+    if (!live) return
+    setError('')
+    setPending(null)
+    deleteLane(lane.id).catch(err => {
+      if (err && err.code === 'lane_in_use') {
+        const counts = laneUseCount(err.counts, lane.id)
+        const rest = rows.filter(row => row.id !== lane.id)
+
+        setPending({ counts, id: lane.id, label: lane.label })
+        setTarget(rest.length > 0 ? rest[0].id : '')
+
+        return
+      }
+
+      setError(String((err && err.message) || 'The board refused the removal.'))
+    })
+  }
+
+  const confirmRemove = () => {
+    if (!pending || !target) return
+    setError('')
+    deleteLane(pending.id, target)
+      .then(() => setPending(null))
+      .catch(err => setError(String((err && err.message) || 'The board refused the removal.')))
+  }
+
+  const options = rows.filter(row => !pending || row.id !== pending.id)
 
   return jsxs(Popover, {
     children: [
       jsx(PopoverTrigger, {
         asChild: true,
         children: jsxs(Button, {
-          'aria-label': 'Edit lane labels and order',
+          'aria-label': 'Edit lanes',
           size: 'sm',
           variant: 'outline',
           children: [jsx(Codicon, { name: 'settings-gear', size: '0.875rem' }), 'Lanes']
@@ -7922,8 +8650,79 @@ function LanesPopover({ lanes }) {
         children: jsxs('div', {
           style: S.lanesPop,
           children: [
-            jsx('div', { style: S.kmenuHead, children: 'Rename or reorder a lane' }),
-            ...rows.map((lane, index) => jsx(LaneEditorRow, { index, lane, lanes: rows, total: rows.length }, lane.id))
+            jsx('div', { style: S.kmenuHead, children: 'Rename, reorder, add or remove' }),
+            ...rows.map((lane, index) =>
+              jsx(
+                LaneEditorRow,
+                { index, lane, lanes: rows, live, onRemove: remove, total: rows.length },
+                lane.id
+              )
+            ),
+            live
+              ? jsxs('div', {
+                  style: S.laneRow,
+                  children: [
+                    jsx('input', {
+                      'aria-label': 'New lane name',
+                      onChange: event => setDraft(event.target.value),
+                      onKeyDown: event => {
+                        if (event.key !== 'Enter') return
+                        event.preventDefault()
+                        add()
+                      },
+                      placeholder: 'New lane name',
+                      style: S.laneInput,
+                      value: draft
+                    }),
+                    jsx(Button, {
+                      disabled: !draft.trim(),
+                      onClick: add,
+                      size: 'sm',
+                      variant: 'outline',
+                      children: 'Add lane'
+                    })
+                  ]
+                })
+              : jsx('div', {
+                  style: S.kmenuNote,
+                  children: 'The board backend is not answering, so lanes stay local to this machine.'
+                }),
+            pending
+              ? jsxs('div', {
+                  style: { ...S.laneCol, paddingTop: 4 },
+                  children: [
+                    jsx('div', {
+                      style: S.kmenuNote,
+                      children: `${pending.counts > 0 ? `${pending.counts} ${pending.counts === 1 ? 'session sits' : 'sessions sit'} in ${pending.label}.` : `${pending.label} still has sessions.`} Move them to:`
+                    }),
+                    jsxs('div', {
+                      style: S.laneRow,
+                      children: [
+                        jsx(KanbanSelect, {
+                          ariaLabel: 'Move sessions to a lane',
+                          onChange: setTarget,
+                          options: options.map(row => ({ value: row.id, label: row.label })),
+                          value: target
+                        }),
+                        jsx(Button, {
+                          disabled: !target,
+                          onClick: confirmRemove,
+                          size: 'sm',
+                          variant: 'default',
+                          children: 'Move and remove'
+                        }),
+                        jsx(Button, {
+                          onClick: () => setPending(null),
+                          size: 'sm',
+                          variant: 'ghost',
+                          children: 'Cancel'
+                        })
+                      ]
+                    })
+                  ]
+                })
+              : null,
+            error ? jsx('div', { style: S.laneError, children: error }) : null
           ]
         })
       })
@@ -7931,7 +8730,7 @@ function LanesPopover({ lanes }) {
   })
 }
 
-function KanbanProvenance({ card }) {
+function KanbanProvenance({ card, lanes }) {
   const text = KANBAN_SOURCE_TEXT[card.laneSource] || 'unset'
   const label = text === 'unset' ? 'Lane unset' : `Lane from ${text}`
   const title = card.laneNote ? `${label}: ${card.laneNote}` : label
@@ -7940,7 +8739,7 @@ function KanbanProvenance({ card }) {
     label: title,
     children: jsx('span', {
       'aria-label': title,
-      style: { ...S.kdot, background: SESSION_LANE_VARS[card.lane] || 'var(--ui-text-quaternary)' }
+      style: { ...S.kdot, background: laneColor(card.lane, lanes) }
     })
   })
 }
@@ -8039,7 +8838,7 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
                           children: [
                             jsx('span', {
                               'aria-hidden': 'true',
-                              style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] }
+                              style: { ...S.kdot, marginTop: 0, background: laneColor(lane.id, lanes) }
                             }),
                             lane.label
                           ]
@@ -8077,7 +8876,7 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
 
 function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpenProject, onOpenSession, state }) {
   return jsxs('div', {
-    'aria-label': `${card.title}. ${SESSION_LANE_LABELS[card.lane] || ''} lane.`,
+    'aria-label': `${card.title}. ${laneLabel(card.lane, lanes)} lane.`,
     className: 'pcc-kcard',
     'data-dragging': dragId === card.id ? 'true' : 'false',
     draggable: true,
@@ -8103,7 +8902,7 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
         children: [
           jsx('span', { style: S.kcardTitle, children: card.title }, 'title'),
           state && state !== 'idle' ? jsx(LiveDot, { state }, 'live') : null,
-          jsx(KanbanProvenance, { card }, 'provenance'),
+          jsx(KanbanProvenance, { card, lanes }, 'provenance'),
           jsx(KanbanCardMenu, { card, lanes, onMove, onOpenProject, onOpenSession }, 'menu')
         ]
       }),
@@ -8147,12 +8946,13 @@ function KanbanColumn({ cards, count, dropLane, dragId, lanes, lane, onDragEnd, 
           children: [
             jsx('span', {
               'aria-hidden': 'true',
-              style: { ...S.kdot, marginTop: 0, background: SESSION_LANE_VARS[lane.id] }
+              style: { ...S.kdot, marginTop: 0, background: laneColor(lane.id, lanes) }
             }),
             jsx('span', {
               style: { fontSize: '0.8125rem', fontWeight: 500, color: 'var(--ui-text-secondary)' },
               children: lane.label
             }),
+            lane.custom ? jsx(Badge, { size: 'xs', variant: 'outline', children: 'custom' }) : null,
             jsx('span', { style: { ...S.count, marginLeft: 'auto' }, children: count })
           ]
         })
@@ -8345,21 +9145,10 @@ function KanbanViews({ byLane, counts, direction, dragCard, dropLane, lanes, onD
   })
 }
 
-// The page. Everything it renders comes from three reads it shares with the
-// board: the tree (labels and folders), session.list (the cards themselves) and
-// /board (lanes and links). The kanban and the table are two views of one
-// filtered card list, so a filter can never apply to one and not the other.
-function SessionsKanbanPage() {
-  const [view, setView] = useState('kanban')
-  const [search, setSearch] = useState('')
-  const [projectFilter, setProjectFilter] = useState('')
-  const [sourceFilter, setSourceFilter] = useState('')
-  const [staleOnly, setStaleOnly] = useState(false)
-  const [laneDirection, setLaneDirection] = useState(1)
-  const [dragCard, setDragCard] = useState(null)
-  const [dropLane, setDropLane] = useState('')
-  const [spin, setSpin] = useState(false)
-  const lanes = useValue($lanes)
+// The reads and the card shape every session view shares: the tree (labels and
+// folders), the gateway's session list, /board's links and the PR refs the lane
+// rule reads. One hook, so Branches and Issues cost no extra network calls.
+function useSessionCards(lanes) {
   const statuses = useValue($statuses)
   const overrides = useValue($sessionStatus)
 
@@ -8430,19 +9219,48 @@ function SessionsKanbanPage() {
         project,
         pr,
         projectLane: projectId ? statuses[projectId] : '',
-        branch: folder ? branches[folder] : '',
-        now
+        // A session that knows its own checkout branch groups by that; the
+        // folder's checked-out branch is the fallback the card already shows.
+        branch: String(session.git_branch || '').trim() || (folder ? branches[folder] : ''),
+        now,
+        lanes
       })
       const override = overrides[session.id]
 
       return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
     })
-  }, [sessionsQuery.data, linkBySession, projectById, refsByProject, statuses, branches, overrides])
+  }, [sessionsQuery.data, linkBySession, projectById, refsByProject, statuses, branches, overrides, lanes])
 
-  const ordered = useMemo(() => normalizeKanbanLanes(lanes), [lanes])
+  return { boardState, cards, live, projectById, projects, sessionsQuery, tree }
+}
+
+// The Status view. It renders one filtered card list two ways: the kanban and
+// the table, so a filter can never apply to one and not the other. Embedded in
+// the merged page it drops the page chrome and keeps a toolbar.
+function SessionsKanbanPage({ embedded }) {
+  const [view, setView] = useState('kanban')
+  const [search, setSearch] = useState('')
+  const [projectFilter, setProjectFilter] = useState('')
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [staleOnly, setStaleOnly] = useState(false)
+  const [laneDirection, setLaneDirection] = useState(1)
+  const [dragCard, setDragCard] = useState(null)
+  const [dropLane, setDropLane] = useState('')
+  const [spin, setSpin] = useState(false)
+  const laneState = useLaneTable()
+  const ordered = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const { boardState, cards, live, projects, sessionsQuery } = useSessionCards(ordered)
+
+  // A lane deleted while this tab was open leaves cards pointing at it; the
+  // filter list is placed on the live table, so those cards surface in the first
+  // lane instead of disappearing.
   const filtered = useMemo(
-    () => kanbanFilterCards(cards, { projectId: projectFilter, search, source: sourceFilter, staleOnly }),
-    [cards, projectFilter, search, sourceFilter, staleOnly]
+    () =>
+      kanbanPlaceCards(
+        kanbanFilterCards(cards, { projectId: projectFilter, search, source: sourceFilter, staleOnly }),
+        ordered
+      ),
+    [cards, projectFilter, search, sourceFilter, staleOnly, ordered]
   )
   const counts = useMemo(() => kanbanCounts(filtered, ordered), [filtered, ordered])
   const byLane = useMemo(() => {
@@ -8541,17 +9359,17 @@ function SessionsKanbanPage() {
   }
 
   return jsxs('div', {
-    style: S.page,
+    style: embedded ? S.viewBody : S.page,
     children: [
-      jsx('style', { children: CSS_TEXT }),
-      jsxs('header', {
-        style: S.header,
+      embedded ? null : jsx('style', { children: CSS_TEXT }),
+      jsxs(embedded ? 'div' : 'header', {
+        style: embedded ? S.viewBar : S.header,
         children: [
-          jsx('h1', { style: S.title, children: 'Sessions' }),
+          embedded ? null : jsx('h1', { style: S.title, children: 'Sessions' }),
           jsx('span', { style: S.count, children: countLabel }),
           jsx('span', { style: S.grow }),
           jsx(SegmentedControl, { onChange: setView, options: KANBAN_VIEWS, sizing: 'content', value: view }),
-          jsx(LanesPopover, { lanes: ordered }),
+          jsx(LanesPopover, { lanes: ordered, live: laneState.live }),
           jsx(Tip, {
             label: 'Refresh',
             children: jsx(Button, {
@@ -8616,6 +9434,180 @@ function SessionsKanbanPage() {
             ]
           })
         : null,
+      !laneState.live && laneState.query.isFetched
+        ? jsxs('div', {
+            style: S.notice,
+            children: [
+              jsx(Codicon, { name: 'warning', size: '0.875rem' }),
+              jsx('span', {
+                children: 'No lane route on this backend, so the five default lanes are local to this machine.'
+              })
+            ]
+          })
+        : null,
+      body
+    ]
+  })
+}
+
+// ── the merged page ──────────────────────────────────────────────────────────
+// One route, four views. The switcher has four fixed options, so its width never
+// depends on the data behind it and the header does not shift between views.
+
+function ViewSwitcher() {
+  const view = useValue($view)
+
+  return jsx('span', {
+    style: S.viewSwitch,
+    children: jsx(SegmentedControl, { onChange: writeView, options: VIEWS, sizing: 'content', value: view })
+  })
+}
+
+// The project page's session row, fed from a kanban card: one row component for
+// Branches and Issues, and one lane badge for both.
+function GroupedSessions({ groups, icon, lanes, live, onOpenSession, quiet }) {
+  return jsx('div', {
+    style: S.groupList,
+    children: groups.map(group =>
+      jsxs(
+        'section',
+        {
+          'aria-label': group.label,
+          style: S.lane,
+          children: [
+            jsxs('div', {
+              style: S.laneHead,
+              children: [
+                jsx(Codicon, { name: group.icon || icon, size: '0.8125rem', style: { flex: 'none' } }),
+                jsx('span', { style: { ...S.ellipsis, fontWeight: 600 }, children: group.label }),
+                jsx('span', { style: S.grow }),
+                jsx('span', { style: S.count, children: group.cards.length })
+              ]
+            }),
+            group.cards.length === 0
+              ? jsx('div', { style: S.quiet, children: quiet })
+              : group.cards.map(card =>
+                  jsx(
+                    DetailSessionRow,
+                    {
+                      lane: cardLane(card),
+                      lanes,
+                      onOpen: onOpenSession,
+                      projectLabel: card.projectLabel,
+                      session: cardAsSession(card),
+                      state: live.get(card.sessionId)
+                    },
+                    card.id
+                  )
+                )
+          ]
+        },
+        group.key
+      )
+    )
+  })
+}
+
+const GROUP_VIEWS = {
+  branches: { empty: 'No sessions to group by branch yet.', icon: 'git-branch', quiet: 'No sessions on this branch', title: 'Branches' },
+  issues: { empty: 'No sessions to group by issue or pull request yet.', icon: 'issues', quiet: 'No sessions in this group', title: 'Issues' }
+}
+
+// Branches and Issues read the same cards as Status with a cheap subset of its
+// filters (project and search), then group them with the pure helpers. Nothing
+// here adds a request: useSessionCards is the same three reads.
+function SessionGroupView({ embedded, mode }) {
+  const copy = GROUP_VIEWS[mode] || GROUP_VIEWS.branches
+  const [search, setSearch] = useState('')
+  const [projectFilter, setProjectFilter] = useState('')
+  const laneState = useLaneTable()
+  const ordered = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const { cards, live, projects } = useSessionCards(ordered)
+  const filtered = useMemo(
+    () => kanbanPlaceCards(kanbanFilterCards(cards, { projectId: projectFilter, search }), ordered),
+    [cards, projectFilter, search, ordered]
+  )
+  const groups = useMemo(
+    () => (mode === 'issues' ? kanbanIssueGroups(filtered) : kanbanBranchGroups(filtered)),
+    [mode, filtered]
+  )
+  const projectOptions = [
+    { value: '', label: 'All projects' },
+    ...projects.map(project => ({ value: project.id, label: project.label || project.id }))
+  ]
+  const countLabel = `${filtered.length} ${filtered.length === 1 ? 'session' : 'sessions'}`
+
+  return jsxs('div', {
+    style: embedded ? S.viewBody : S.page,
+    children: [
+      embedded ? null : jsx('style', { children: CSS_TEXT }),
+      jsxs(embedded ? 'div' : 'header', {
+        style: embedded ? S.viewBar : S.header,
+        children: [
+          embedded ? null : jsx('h1', { style: S.title, children: copy.title }),
+          jsx('span', { style: S.count, children: cards.length > 0 ? countLabel : '' }),
+          jsx('span', { style: S.grow }),
+          jsx(KanbanSelect, {
+            ariaLabel: 'Filter by project',
+            onChange: setProjectFilter,
+            options: projectOptions,
+            value: projectFilter
+          }),
+          jsx('div', {
+            style: S.searchWrap,
+            children: jsx(SearchField, {
+              'aria-label': 'Search sessions',
+              onChange: setSearch,
+              placeholder: 'Search title, project, branch or number',
+              value: search
+            })
+          })
+        ]
+      }),
+      cards.length === 0
+        ? jsx('div', {
+            style: { flex: '1 1 0', display: 'grid', placeItems: 'center' },
+            children: jsx(EmptyState, {
+              description: 'Sessions appear here once the gateway has one to list.',
+              title: copy.empty
+            })
+          })
+        : jsx(GroupedSessions, {
+            groups,
+            icon: copy.icon,
+            lanes: ordered,
+            live: live.byStored,
+            onOpenSession: openSession,
+            quiet: copy.quiet
+          })
+    ]
+  })
+}
+
+// The one page the sidebar and the palette open. The view is storage-backed, so
+// a reload lands where the user left it; a route visit without a stored view
+// opens Status first.
+function ProjectCommandCenterPage() {
+  const view = useValue($view)
+  let body
+
+  if (view === 'projects') body = jsx(ProjectsPage, { embedded: true })
+  else if (view === 'branches') body = jsx(SessionGroupView, { embedded: true, mode: 'branches' })
+  else if (view === 'issues') body = jsx(SessionGroupView, { embedded: true, mode: 'issues' })
+  else body = jsx(SessionsKanbanPage, { embedded: true })
+
+  return jsxs('div', {
+    style: S.page,
+    children: [
+      jsx('style', { children: CSS_TEXT }),
+      jsxs('header', {
+        style: S.header,
+        children: [
+          jsx('h1', { style: S.title, children: 'Project Command Center' }),
+          jsx('span', { style: S.grow }),
+          jsx(ViewSwitcher, {})
+        ]
+      }),
       body
     ]
   })
@@ -8660,29 +9652,27 @@ export default {
     $statuses.set(readStatuses())
     $lanes.set(readLanes())
     $sort.set(readSort())
+    $view.set(readView())
     $ghPreset.set(readGhPreset())
     $openProject.set(readOpenProject())
 
     ctx.registerMany([
       { id: 'titlebar', area: TITLEBAR_TOOL_AREA, order: 40, data: titlebarTool() },
-      { id: 'page', area: ROUTES_AREA, title: 'Projects', data: { path: ROUTE }, render: () => jsx(ProjectsPage, {}) },
+      // One page. The view switcher inside it picks Status, Projects, Branches
+      // or Issues, so the sidebar keeps a single entry and the route stays put.
+      { id: 'page', area: ROUTES_AREA, title: 'Projects', data: { path: ROUTE }, render: () => jsx(ProjectCommandCenterPage, {}) },
       // A second page, not a drawer: the board stays the board, and a project
       // gets a page of its own that a tab can hold.
       { id: 'project-page', area: ROUTES_AREA, title: 'Project', data: { path: PROJECT_ROUTE }, render: () => jsx(ProjectDetailPage, {}) },
-      // The session kanban: every project's sessions on one lane board.
-      { id: 'sessions-page', area: ROUTES_AREA, title: 'Sessions', data: { path: SESSIONS_ROUTE }, render: () => jsx(SessionsKanbanPage, {}) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: ROUTE, label: 'Projects', codicon: 'project' } },
-      // No `kanban` glyph in the Codicon set this app ships, so the nav uses the
-      // project glyph rather than a name the Codicon component cannot resolve.
-      { id: 'sessions-nav', area: SIDEBAR_NAV_AREA, data: { path: SESSIONS_ROUTE, label: 'Sessions', codicon: 'project' } },
       {
         id: 'open',
         area: PALETTE_AREA,
         data: {
           id: `${PLUGIN_ID}.open`,
           label: 'Open Projects',
-          keywords: ['projects', 'project', 'board', 'kanban', 'sessions', 'command center'],
-          run: () => host.navigate(ROUTE)
+          keywords: ['projects', 'project', 'board', 'command center'],
+          run: () => openView('projects')
         }
       },
       {
@@ -8690,9 +9680,19 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: `${PLUGIN_ID}.sessions`,
-          label: 'Open Sessions',
-          keywords: ['sessions', 'kanban', 'lanes', 'board', 'project', 'command center'],
-          run: () => host.navigate(SESSIONS_ROUTE)
+          label: 'Open Sessions board',
+          keywords: ['sessions', 'kanban', 'lanes', 'status', 'board', 'project', 'command center'],
+          run: () => openView('status')
+        }
+      },
+      {
+        id: 'open-issues',
+        area: PALETTE_AREA,
+        data: {
+          id: `${PLUGIN_ID}.issues`,
+          label: 'Open Issues',
+          keywords: ['issues', 'pull requests', 'merged', 'review', 'sessions', 'command center'],
+          run: () => openView('issues')
         }
       }
     ])

@@ -9608,7 +9608,7 @@ function ProjectCommandCenterPage() {
           jsxs('div', {
             style: S.titleRow,
             children: [
-              jsx(PillarIcon, { size: '18px', style: S.titleIcon }),
+              jsx(Codicon, { name: 'inbox', size: '18px', style: S.titleIcon }),
               jsx('h1', { style: S.title, children: 'Project Command Center' })
             ]
           }),
@@ -9631,31 +9631,12 @@ function ProjectCommandCenterPage() {
 // it yet, so the area name is written out.
 const TITLEBAR_TOOL_AREA = 'titleBar.tools.right'
 
-// Material Design Icons "pillar" (mdi:pillar), inlined so the page needs no
-// Iconify dependency and no network read at render. MDI is Apache 2.0,
-// Pictogrammers; the path is unmodified. The sidebar nav cannot take this yet:
-// a nav contribution carries a codicon name, not an icon node.
-const PILLAR_PATH =
-  'M6 5h12a1 1 0 0 1 1 1a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1a1 1 0 0 1 1-1m15-3v2H3V2zm-6 6h2v14h-2zM7 8h2v14H7zm4 0h2v14h-2z'
-
-function PillarIcon({ size = '14px', style }) {
-  return jsx('svg', {
-    'aria-hidden': 'true',
-    fill: 'none',
-    height: size,
-    style: style || { display: 'block' },
-    viewBox: '0 0 24 24',
-    width: size,
-    children: jsx('path', { d: PILLAR_PATH, fill: 'currentColor' })
-  })
-}
-
 function titlebarTool() {
   return {
     id: 'pcc-open',
     label: 'Projects',
     title: 'Projects',
-    icon: jsx(PillarIcon, { size: '13.9px' }),
+    icon: jsx(Codicon, { name: 'inbox', size: '13.9px' }),
     to: ROUTE
   }
 }
@@ -9691,7 +9672,7 @@ export default {
       // A second page, not a drawer: the board stays the board, and a project
       // gets a page of its own that a tab can hold.
       { id: 'project-page', area: ROUTES_AREA, title: 'Project', data: { path: PROJECT_ROUTE }, render: () => jsx(ProjectDetailPage, {}) },
-      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: ROUTE, label: 'Projects', codicon: 'project' } },
+      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: ROUTE, label: 'Projects', codicon: 'inbox' } },
       {
         id: 'open',
         area: PALETTE_AREA,

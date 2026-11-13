@@ -35,12 +35,13 @@ Git is read only except one route: ``POST /branch/switch`` runs ``git switch``
 on the main checkout after refusing a dirty tree, a linked worktree, a branch
 checked out elsewhere and any in-progress operation. It never stashes, never
 discards and never forces, and every git child is a fixed argv.
-GitHub writes are four routes and nothing else: ``POST /github/issue/{n}/comment`` and
-``POST /github/pr/{n}/comment`` post one comment, and
+GitHub writes are five routes and nothing else: ``POST /github/issue/{n}/comment`` and
+``POST /github/pr/{n}/comment`` post one comment,
 ``POST /github/issue/{n}/state`` / ``POST /github/pr/{n}/state`` set open or
-closed. All four write over the authenticated ``gh`` CLI as that account (never
-the token), with a JSON body on the child's stdin so no comment text is ever
-quoted into a command line.
+closed, and ``POST /github/reaction`` toggles one reaction on a body, an issue
+comment or a review comment. All five write over the authenticated ``gh`` CLI as
+that account (never the token), with a JSON body on the child's stdin so no
+comment text is ever quoted into a command line.
 No shell: every child is ``create_subprocess_exec`` with an argv and a
 timeout; no ``shell=True``, no ``os.system``, no command string. No credential
 files: ``GITHUB_TOKEN`` comes from ``agent.secret_scope.get_secret`` inside the
@@ -119,6 +120,11 @@ MAX_CONCURRENT_GITHUB_CALLS = 2
 MAX_PRS_ENRICHED = 10
 MAX_BRANCHES = 40
 MAX_COMMENTS = 100
+# Reactions are one REST read per object (GitHub has no batch endpoint for them),
+# so a thread with a hundred comments would pay a hundred round trips. The body
+# and the first MAX_REACTION_OBJECTS comments carry reactions; every other
+# comment still carries the key, as an empty list, so the modal's shape holds.
+MAX_REACTION_OBJECTS = 30
 MAX_REFS = 50
 MAX_COUNT_PATHS = 50
 API = "https://api.github.com"
@@ -219,6 +225,15 @@ class CommentRow(TypedDict):
     created_at: Optional[str]
     updated_at: Optional[str]
     url: Optional[str]
+    reactions: NotRequired[list[dict[str, Any]]]
+
+
+class ReactionRow(TypedDict):
+    """One reaction content on one object: how many, and whether this account is in it."""
+
+    content: str
+    count: int
+    mine: bool
 
 
 class ReviewRow(TypedDict):
@@ -387,6 +402,13 @@ FAILURE_CODES = frozenset({"folder_missing", "not_a_repo", "no_remote", "repo_no
 # one of these, and an unknown code is upstream_error rather than a class name.
 WRITE_CODES = frozenset({"empty_comment", "bad_state", "not_found", "forbidden",
                          "rate_limited", "upstream_error"})
+
+# GitHub's eight reaction contents, in its own canonical order. The write route
+# takes exactly these strings, not the emoji and not the GraphQL enum names.
+REACTION_CONTENTS = ("+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes")
+REACTION_KINDS = frozenset({"issue", "pr", "issue_comment", "review_comment"})
+# A reaction refusal names its reason with one of these, never a status line.
+REACTION_CODES = frozenset({"bad_kind", "bad_content", "gh_unavailable", "gh_error"})
 
 
 class _FolderMissing(Exception):
@@ -1856,6 +1878,96 @@ def _review_rows(rows: Any) -> list[ReviewRow]:
     return out
 
 
+# --- Reactions --------------------------------------------------------------
+#
+# GitHub keeps reactions per object and has no batch read for them: the issue or
+# PR body, each issue comment and each review comment answers on its own URL.
+# Rows are aggregated here into the modal's shape — one entry per content, in
+# GitHub's canonical order — and a failed read degrades that object to an empty
+# list instead of failing the whole detail.
+
+
+def _reaction_count(rows: Any, me: Optional[str]) -> list[dict[str, Any]]:
+    """Raw reaction rows -> ``[{content, count, mine}]``, order fixed, empties dropped.
+
+    ``mine`` is true only when the authenticated login is in that content's own
+    ``users`` list: another account's reaction of the same content never counts.
+    """
+    tally: dict[str, dict[str, Any]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        content = str(row.get("content") or "")
+        if content not in REACTION_CONTENTS:
+            continue
+        entry = tally.setdefault(content, {"content": content, "count": 0, "mine": False})
+        entry["count"] += 1
+        user = row.get("user")
+        login = user.get("login") if isinstance(user, dict) else ""
+        if me and str(login or "") == me:
+            entry["mine"] = True
+    return [tally[content] for content in REACTION_CONTENTS if content in tally]
+
+
+def _reaction_toggled(reactions: Sequence[dict[str, Any]], content: str,
+                      *, removed: bool) -> list[dict[str, Any]]:
+    """The list after one toggle, for when the confirming re-read fails.
+
+    It is only ever a fallback: the route prefers the fresh read, and this keeps
+    the chip row on screen with the change the user just made instead of blanking.
+    """
+    tally = {str(row.get("content")): dict(row) for row in reactions
+             if isinstance(row, dict) and row.get("content") in REACTION_CONTENTS}
+    entry = tally.get(content)
+    if entry is None:
+        entry = {"content": content, "count": 1, "mine": True}
+        if removed:
+            entry = {"content": content, "count": 0, "mine": False}
+        tally[content] = entry
+    elif removed:
+        entry["count"] = max(0, _int(entry.get("count")) - 1)
+        entry["mine"] = False
+    else:
+        entry["count"] = _int(entry.get("count")) + 1
+        entry["mine"] = True
+    return [tally[c] for c in REACTION_CONTENTS if c in tally and _int(tally[c].get("count")) > 0]
+
+
+async def _reactions(gh: "_GhReader", path: str, me: Optional[str]) -> list[dict[str, Any]]:
+    """One object's reactions; a failed read is ``[]``, never an exception."""
+    try:
+        response = await gh.rest(path, {"per_page": 100})
+    except _UpstreamError as exc:
+        log.info("project-command-center: reactions unavailable at %s: %s", path, exc)
+        return []
+    return _reaction_count(_as_list(response), me)
+
+
+def _comment_reaction_path(owner: str, name: str, comment_id: int) -> str:
+    return f"/repos/{owner}/{name}/issues/comments/{comment_id}/reactions"
+
+
+async def _attach_reactions(gh: "_GhReader", comments: Sequence[CommentRow],
+                            me: Optional[str], owner: str, name: str) -> list[CommentRow]:
+    """Fill ``reactions`` on every comment, reading at most MAX_REACTION_OBJECTS.
+
+    The reads are one gather, so a thread costs its comments' reactions at the
+    GitHub client's two-in-flight bound rather than one round trip after another.
+    """
+    targets = comments[:MAX_REACTION_OBJECTS]
+    wanted = [c for c in targets if _int(c.get("id")) > 0]
+    if wanted:
+        found = await asyncio.gather(*(
+            _reactions(gh, _comment_reaction_path(owner, name, _int(c.get("id"))), me)
+            for c in wanted))
+        by_id = {_int(c.get("id")): reactions for c, reactions in zip(wanted, found)}
+    else:
+        by_id = {}
+    for comment in comments:
+        comment["reactions"] = by_id.get(_int(comment.get("id")), [])
+    return list(comments)
+
+
 def _counts(issues: Sequence[IssueRow], pulls: Sequence[PullRow]) -> Counts:
     """Board aggregates. ``review_ready`` is: open, not a draft, no failing checks and no
     requested changes, so the number matches the rows a reviewer can act on today. The four
@@ -2045,20 +2157,25 @@ def _cache_drop(owner: str, name: str) -> None:
         _CACHE.pop(key, None)
 
 
-async def _gh_write(method: str, path: str, body: Mapping[str, Any], *, subject: str,
+async def _gh_write(method: str, path: str, body: Optional[Mapping[str, Any]], *, subject: str,
                     action: str, owner: str, repo: str, number: int) -> Any:
     """One ``gh api`` write with the JSON body on the child's stdin.
 
     The argv is fixed — ``gh api -i --method <M> --input - <endpoint>`` — so the
     body never appears in an argument and there is no shell: a comment holding
-    quotes, backticks, ``$(`` or newlines arrives byte for byte. Statuses become
-    codes: 404 ``not_found``, 401/403 ``forbidden`` (a spent 403 or 429 is
+    quotes, backticks, ``$(`` or newlines arrives byte for byte. ``body=None``
+    (a DELETE with nothing to say) drops ``--input -`` instead of sending ``{}``.
+    Statuses become codes: 404 ``not_found``, 401/403 ``forbidden`` (a spent 403 or 429 is
     ``rate_limited``), anything else ``upstream_error``.
     """
-    argv = ["gh", "api", "-i", "--method", method.upper(), "--input", "-", path]
+    argv = ["gh", "api", "-i", "--method", method.upper()]
+    stdin: Optional[str] = None
+    if body is not None:
+        argv += ["--input", "-"]
+        stdin = json.dumps(dict(body), ensure_ascii=False)
+    argv.append(path)
     try:
-        code, out, err = await _run(argv, timeout=GH_TIMEOUT,
-                                    stdin_data=json.dumps(dict(body), ensure_ascii=False))
+        code, out, err = await _run(argv, timeout=GH_TIMEOUT, stdin_data=stdin)
     except TimeoutError as exc:
         raise _WriteFailure(
             "upstream_error",
@@ -2218,6 +2335,116 @@ async def _set_state(number: int, path: str, payload: Mapping[str, Any],
     _cache_drop(owner, name)
     written = data.get("state") if isinstance(data, dict) else None
     return {"ok": True, "state": str(written or state).lower()}
+
+
+# --- Reactions --------------------------------------------------------------
+#
+# One route toggles a reaction on any of GitHub's four reacting objects. Reads
+# run as the same gh account the write will use, so `mine` and the toggle agree
+# about whose reaction they are looking at. Nothing raises: a refusal is HTTP 200
+# with a code from REACTION_CODES.
+
+
+def _reaction_refusal(code: str, error: str, detail: Optional[str] = None) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, "detail": detail, "reactions": []}
+
+
+def _reaction_url(owner: str, name: str, kind: str, number: int, comment_id: int) -> str:
+    """The reactions collection for one object, per GitHub's REST layout."""
+    if kind in ("issue", "pr"):
+        # A pull request's body is an issue body to the reactions API.
+        return f"/repos/{owner}/{name}/issues/{number}/reactions"
+    if kind == "issue_comment":
+        return f"/repos/{owner}/{name}/issues/comments/{comment_id}/reactions"
+    return f"/repos/{owner}/{name}/pulls/comments/{comment_id}/reactions"
+
+
+async def _set_reaction(payload: Mapping[str, Any], folder: str) -> dict[str, Any]:
+    """Add one reaction as the gh account, or remove it when that account already has it."""
+    kind = str(payload.get("kind") or "").strip().lower()
+    content = str(payload.get("content") or "").strip()
+    number = _int(payload.get("number"))
+    comment_id = _int(payload.get("comment_id"))
+
+    if kind not in REACTION_KINDS:
+        return _reaction_refusal(
+            "bad_kind", f'kind must be one of {", ".join(sorted(REACTION_KINDS))}, '
+                        f'not {kind or "nothing"}.')
+    if content not in REACTION_CONTENTS:
+        return _reaction_refusal(
+            "bad_content", f'content must be one of {", ".join(REACTION_CONTENTS)}, '
+                           f'not {content or "nothing"}.')
+    if kind in ("issue", "pr") and number <= 0:
+        return _reaction_refusal(
+            "bad_kind", f"A reaction on {'a pull request' if kind == 'pr' else 'an issue'} "
+                        "needs its number.")
+    if kind in ("issue_comment", "review_comment") and comment_id <= 0:
+        return _reaction_refusal(
+            "bad_kind", "A reaction on a "
+                        f"{'review comment' if kind == 'review_comment' else 'issue comment'} "
+                        "needs its comment_id.")
+    if not str(folder or "").strip():
+        # The write routes carry the folder in the query string; this one may
+        # also carry it in the body, so an empty one is a caller mistake, not a
+        # repository that cannot be reached.
+        return _reaction_refusal("bad_kind", "A reaction needs the project folder to find its repository.")
+
+    repo = await _write_repo(folder)
+    if isinstance(repo, dict):
+        # A folder with no GitHub remote is "GitHub is unavailable here", which
+        # is the one stable code this route offers for it.
+        return _reaction_refusal("gh_unavailable",
+                                 repo.get("error") or "The project folder has no GitHub repository.",
+                                 repo.get("detail"))
+    owner, name = repo
+    me = await _gh_user()
+    if me is None:
+        return _reaction_refusal(
+            "gh_unavailable",
+            "GitHub reactions run as the gh CLI's account and gh is not signed in. "
+            "Run gh auth login, then retry.")
+
+    url = _reaction_url(owner, name, kind, number, comment_id)
+    subject = {"issue": "issue", "pr": "pull request", "issue_comment": "comment",
+               "review_comment": "review comment"}[kind]
+    anchor = number if number > 0 else comment_id
+    client = _GitHub(owner, name, "gh", None)
+    try:
+        before = _as_list(await client.rest(url, {"per_page": 100}))
+    except _UpstreamError as exc:
+        return _reaction_refusal(
+            "gh_error", f"GitHub could not read the reactions on this {subject}.",
+            exc.detail or f"GET {url} -> {exc.code}")
+    existing = next((row for row in before if isinstance(row, dict)
+                     and str(row.get("content") or "") == content
+                     and isinstance(row.get("user"), dict)
+                     and str(row["user"].get("login") or "") == me
+                     and _int(row.get("id")) > 0), None)
+    try:
+        if existing is not None:
+            await _gh_write("DELETE", f"{url}/{_int(existing.get('id'))}", None,
+                            subject=subject, action="remove a reaction from",
+                            owner=owner, repo=name, number=anchor)
+        else:
+            await _gh_write("POST", url, {"content": content}, subject=subject,
+                            action="react to", owner=owner, repo=name, number=anchor)
+    except _WriteFailure as exc:
+        log.info("project-command-center: reaction write failed: %s", exc.error)
+        return _reaction_refusal("gh_error", exc.error, exc.detail)
+
+    _cache_drop(owner, name)
+    try:
+        after = _as_list(await client.rest(url, {"per_page": 100}))
+    except _UpstreamError as exc:
+        log.info("project-command-center: reaction re-read failed: %s", exc)
+        # The write landed; the row keeps the user's click rather than going
+        # blank because the confirming read was the one call that failed.
+        return {"ok": True, "toggled": "removed" if existing is not None else "added",
+                "reactions": _reaction_toggled(_reaction_count(before, me), content,
+                                               removed=existing is not None),
+                "stale": True}
+    return {"ok": True, "toggled": "removed" if existing is not None else "added",
+            "reactions": _reaction_count(after, me)}
 
 
 # --- Icons -------------------------------------------------------------------
@@ -3518,6 +3745,13 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
     comments = _comment_rows(_as_list(comments_response))
     timeline_issues = _timeline_refs(_as_list(timeline_response))[1]
 
+    # The reactions are read as the credential that answered above, and `mine`
+    # is that account's own reaction: a failed read is [] for that object only.
+    me = await _account_name(gh, token)
+    body_reactions = await _reactions(
+        gh, f"/repos/{owner}/{name}/issues/{number}/reactions", me)
+    comments = await _attach_reactions(gh, comments, me, owner, name)
+
     node = (await _enrich_pulls(gh, [number])).get(number)
     row = _pull_row(raw, node)
     linked = sorted(set(row["linked_issues"]) | set(timeline_issues))
@@ -3532,6 +3766,7 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
         "files_changed": files,
         "reviews": reviews,
         "comments": comments,
+        "reactions": body_reactions,
         # None, not {"state": "none"}, when the GraphQL pass could not answer:
         # the modal shows a checks row only for a real rollup.
         "checks": row["checks"] if node is not None else None,
@@ -3576,6 +3811,10 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
     )
     timeline_pulls = _timeline_refs(_as_list(timeline_response))[0]
     comments = _comment_rows(_as_list(comments_response))
+    me = await _account_name(gh, token)
+    body_reactions = await _reactions(
+        gh, f"/repos/{owner}/{name}/issues/{number}/reactions", me)
+    comments = await _attach_reactions(gh, comments, me, owner, name)
     account = await _account_name(gh, token) if gh.auth_note else None
     payload = {
         "ok": True, "code": "ok", "error": None, "detail": None,
@@ -3590,6 +3829,7 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
         "assignees": _names(raw.get("assignees"), "login"),
         **({"assignee_avatars": avatars} if (avatars := _assignee_avatars(raw.get("assignees"))) else {}),
         "comments": comments,
+        "reactions": body_reactions,
         "comments_count": _int(raw.get("comments")),
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
@@ -3870,6 +4110,26 @@ async def github_pr_state(number: int, path: str = Query(...),
                           payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
     """Open or close a pull request; the number must be a PR, not an issue."""
     return await _set_state(number, path, payload, "pr")
+
+
+@router.post("/github/reaction")
+async def github_reaction(path: Optional[str] = Query(None),
+                          payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Toggle one reaction on an issue, PR, issue comment or review comment.
+
+    Body: ``{kind, number?, comment_id?, path?, content}`` where ``kind`` is
+    ``issue``, ``pr``, ``issue_comment`` or ``review_comment`` and ``content`` is
+    one of ``+1``, ``-1``, ``laugh``, ``hooray``, ``confused``, ``heart``,
+    ``rocket``, ``eyes``. The folder may ride in the query string (like every
+    other write) or in the body. When the gh account already reacted with that
+    content the same call removes it, so one click toggles; the answer is
+    ``{ok, reactions, toggled}`` for the affected object, ready to repaint the
+    chip row without a reload. Refusals stay HTTP 200 with a code from
+    ``REACTION_CODES``: ``bad_kind``, ``bad_content``, ``gh_unavailable``,
+    ``gh_error``.
+    """
+    folder = path if isinstance(path, str) and path.strip() else str(payload.get("path") or "")
+    return await _set_reaction(payload, folder)
 
 
 # --- Diagnose ---------------------------------------------------------------

@@ -1267,6 +1267,20 @@ function useBoard() {
   return { data, links, live: Boolean(data), query }
 }
 
+// The Link to session menu needs the links only: the same query key serves it
+// from an open board's cache, and the board's seeding and polling effects are
+// not mounted a second time by a modal.
+function useBoardLinks() {
+  const query = useQuery({
+    queryFn: () => boardRest('/board'),
+    queryKey: [QUERY_ROOT, 'board'],
+    retry: false,
+    staleTime: 8000
+  })
+
+  return useMemo(() => (query.data && Array.isArray(query.data.links) ? query.data.links : []), [query.data])
+}
+
 // project id → the issue and PR numbers a session is linked to, newest link last.
 function linksByProject(links) {
   const map = new Map()
@@ -1676,6 +1690,15 @@ function openSession(id) {
   })
 }
 
+// An existing session already has a tab to open; the text goes in after it
+// paints, through the same bounded retry every other seeded composer uses. No
+// turn is sent: the text is the user's to edit.
+function openLinkedSession(sessionId, text) {
+  openSession(sessionId)
+
+  return seedSessionDraft(sessionId, text)
+}
+
 // ── styles ───────────────────────────────────────────────────────────────────
 const CSS_TEXT = `
 .pcc-col { animation: pcc-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: calc(min(var(--pcc-i, 0), 8) * 28ms); }
@@ -1698,6 +1721,10 @@ const CSS_TEXT = `
 .pcc-detail-row:hover, .pcc-detail-row:focus-visible { background: var(--chrome-action-hover); outline: none; }
 .pcc-gh-row + .pcc-gh-row { border-top: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 30%, transparent); }
 .pcc-gh-row:hover { background: color-mix(in srgb, var(--chrome-action-hover) 70%, transparent); }
+.pcc-gh-reaction { transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; }
+.pcc-gh-reaction:hover:not(:disabled), .pcc-gh-reaction:focus-visible { border-color: var(--ui-stroke-secondary); color: var(--ui-text-primary); outline: none; }
+.pcc-gh-reaction:disabled { opacity: 0.55; cursor: default; }
+.pcc-gh-reaction-add:hover:not(:disabled) { color: var(--ui-text-primary); }
 .pcc-gh-title:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 2px; border-radius: 3px; }
 .pcc-gh-chip { transition: color 120ms ease, background-color 120ms ease; }
 .pcc-gh-chip:hover, .pcc-gh-chip:focus-visible { color: var(--ui-text-primary); background: var(--chrome-action-hover); outline: none; }
@@ -2367,6 +2394,63 @@ const S = {
     fontSize: '0.6875rem',
     color: 'var(--ui-text-tertiary)'
   },
+  // The reaction row: one line of chips at the modal's width, wrapping only when
+  // a thread carries more than the five the row draws.
+  ghReactions: { display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', minWidth: 0 },
+  ghReactionChip: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    height: 20,
+    padding: '0 6px',
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 60%, transparent)',
+    borderRadius: 999,
+    background: 'transparent',
+    color: 'var(--ui-text-secondary)',
+    font: 'inherit',
+    fontSize: '0.6875rem',
+    lineHeight: 1,
+    cursor: 'pointer'
+  },
+  ghReactionMine: {
+    borderColor: 'color-mix(in srgb, var(--ui-accent) 55%, transparent)',
+    background: 'color-mix(in srgb, var(--ui-accent) 14%, transparent)',
+    color: 'var(--ui-text-primary)'
+  },
+  ghReactionGlyph: {
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.625rem',
+    lineHeight: 1,
+    letterSpacing: '-0.02em'
+  },
+  ghReactionAdd: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 20,
+    height: 20,
+    padding: 0,
+    border: '1px dashed color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
+    borderRadius: 999,
+    background: 'transparent',
+    color: 'var(--ui-text-quaternary)',
+    font: 'inherit',
+    fontSize: '0.75rem',
+    lineHeight: 1,
+    cursor: 'pointer'
+  },
+  ghLinkGroup: {
+    padding: '6px 8px 2px',
+    fontSize: '0.625rem',
+    fontWeight: 600,
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+    color: 'var(--ui-text-quaternary)'
+  },
+  ghLinkRow: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, width: '100%' },
+  ghLinkText: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+  ghLinkTitle: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  ghLinkEmpty: { padding: '2px 8px 6px', fontSize: '0.75rem', color: 'var(--ui-text-quaternary)' },
   ghComposer: {
     display: 'flex',
     flexDirection: 'column',
@@ -4770,7 +4854,361 @@ function GhMiniAvatar({ bot, fallback = 'blob', login, size = 16, src }) {
   })
 }
 
-function GhComment({ comment, decorate, refKey }) {
+// github-reactions:begin
+// Reactions are GitHub's eight contents, in GitHub's own order, and every chip
+// is drawn with a text glyph: a plugin cannot assume an emoji font is installed,
+// so `heart` is U+2665 and `rocket` is a caret, not an emoji codepoint.
+const GH_REACTION_ORDER = ['+1', '-1', 'laugh', 'hooray', 'confused', 'heart', 'rocket', 'eyes']
+const GH_REACTION_GLYPHS = {
+  '+1': '+1',
+  '-1': '\u22121',
+  laugh: ':D',
+  hooray: '\\o/',
+  confused: ':/',
+  heart: '\u2665',
+  rocket: '^',
+  eyes: 'oo'
+}
+const GH_REACTION_LABELS = {
+  '+1': 'Thumbs up',
+  '-1': 'Thumbs down',
+  laugh: 'Laugh',
+  hooray: 'Hooray',
+  confused: 'Confused',
+  heart: 'Heart',
+  rocket: 'Rocket',
+  eyes: 'Eyes'
+}
+// Five chips fit one line at the modal's width; the picker carries all eight.
+const GH_REACTION_CHIPS = 5
+// One quoted line, not the comment: the agent reads the thread itself.
+const GH_DRAFT_QUOTE_MAX = 140
+
+function ghReactionGlyph(content) {
+  return GH_REACTION_GLYPHS[content] || String(content || '')
+}
+
+function ghReactionLabel(content) {
+  return GH_REACTION_LABELS[content] || String(content || '')
+}
+
+// The chip row: only reactions that exist, most used first, canonical order
+// breaking a tie, at most GH_REACTION_CHIPS. A content this build does not know
+// is dropped rather than drawn without a glyph.
+function ghReactionModel(reactions) {
+  const rows = []
+
+  for (const row of Array.isArray(reactions) ? reactions : []) {
+    if (!row || typeof row !== 'object') continue
+
+    const content = String(row.content || '')
+    const order = GH_REACTION_ORDER.indexOf(content)
+    const count = Number(row.count)
+
+    if (order < 0 || !Number.isFinite(count) || count <= 0) continue
+
+    rows.push({ content, count, glyph: ghReactionGlyph(content), label: ghReactionLabel(content), mine: row.mine === true, order })
+  }
+
+  rows.sort((a, b) => b.count - a.count || a.order - b.order)
+
+  return rows.slice(0, GH_REACTION_CHIPS).map(({ order, ...row }) => row)
+}
+
+// The full picker, in GitHub's order.
+function ghReactionPicker() {
+  return GH_REACTION_ORDER.map(content => ({
+    content,
+    glyph: ghReactionGlyph(content),
+    label: ghReactionLabel(content)
+  }))
+}
+
+// One toggle applied locally, so the chip row answers the click before the
+// server does. Removing the last reaction drops the row entirely.
+function ghReactionToggle(reactions, content) {
+  const rows = (Array.isArray(reactions) ? reactions : [])
+    .filter(row => row && typeof row === 'object')
+    .map(row => ({ ...row }))
+  const index = rows.findIndex(row => String(row.content) === content)
+
+  if (index < 0) return [...rows, { content, count: 1, mine: true }]
+
+  const count = Number(rows[index].count) || 0
+
+  if (rows[index].mine === true) {
+    if (count <= 1) {
+      rows.splice(index, 1)
+
+      return rows
+    }
+    rows[index] = { content, count: count - 1, mine: false }
+
+    return rows
+  }
+
+  rows[index] = { content, count: count + 1, mine: true }
+
+  return rows
+}
+
+// The Link to session draft: where the thread lives, who wrote it, one quoted
+// line of it, then a blank line for the user's question. Entry points only —
+// the agent reads the thread with its own tools, and the body never travels
+// into the composer. Nothing here is submitted.
+function ghCommentDraftText({ author, body, number, owner, repo }) {
+  const n = Number(number)
+  const place = owner && repo ? `${owner}/${repo}` : ''
+  const head = [`#${Number.isFinite(n) && n > 0 ? n : 0}`, place].filter(Boolean).join(' \u00b7 ')
+  const first = String(body || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean) || ''
+  const flat = first.replace(/\s+/g, ' ')
+  const quote = flat.length > GH_DRAFT_QUOTE_MAX
+    ? `${flat.slice(0, GH_DRAFT_QUOTE_MAX).trimEnd()}\u2026`
+    : flat
+  const lines = [head]
+
+  if (author) lines.push(`${author} wrote:`)
+  if (quote) lines.push(`> ${quote}`)
+
+  return `${lines.join('\n')}\n\n`
+}
+
+// The session links already attached to this issue or PR. The board links a
+// session to one number, so the kind decides which column is compared.
+function ghLinkedSessions(links, kind, number) {
+  const n = Number(number) || 0
+
+  if (n <= 0) return []
+
+  return (Array.isArray(links) ? links : []).filter(link => {
+    if (!link || !link.session_id) return false
+
+    const value = kind === 'pr' ? Number(link.pr) : Number(link.issue)
+
+    return value === n
+  })
+}
+// github-reactions:end
+
+function GhReactionChip({ busy, onToggle, row }) {
+  return jsx('button', {
+    'aria-label': `${row.label} ${row.count}${row.mine ? ', you reacted' : ''}`,
+    'aria-pressed': row.mine ? 'true' : 'false',
+    className: 'pcc-gh-reaction',
+    disabled: busy,
+    onClick: event => {
+      if (event && event.stopPropagation) event.stopPropagation()
+      onToggle(row.content)
+    },
+    style: row.mine ? { ...S.ghReactionChip, ...S.ghReactionMine } : S.ghReactionChip,
+    title: row.mine ? `${row.label} · click to remove your reaction` : `${row.label} · click to react`,
+    type: 'button',
+    children: [
+      jsx('span', { 'aria-hidden': 'true', style: S.ghReactionGlyph, children: row.glyph }),
+      jsx('span', { children: String(row.count) })
+    ]
+  })
+}
+
+// One object's reactions: the body of the issue/PR, or one comment. The row is
+// optimistic — the click repaints first, the server's answer replaces the whole
+// row on settle, and a refusal reverts and says so in a toast.
+function GhReactions({ commentId, folder, kind, number, reactions }) {
+  const server = Array.isArray(reactions) ? reactions : []
+  const signature = useMemo(() => JSON.stringify(server), [server])
+  const [rows, setRows] = useState(server)
+  const [busy, setBusy] = useState(false)
+  const model = useMemo(() => ghReactionModel(rows), [rows])
+  const picker = useMemo(() => ghReactionPicker(), [])
+  const mine = useMemo(() => new Set(model.filter(row => row.mine).map(row => row.content)), [model])
+
+  useEffect(() => {
+    setRows(server)
+  }, [signature])
+
+  const toggle = content => {
+    if (busy || !pluginCtx) return
+
+    const before = rows
+    const target = kind === 'pr' ? 'pr' : kind === 'review_comment' ? 'review_comment' : kind === 'issue_comment' ? 'issue_comment' : 'issue'
+
+    setRows(ghReactionToggle(before, content))
+    setBusy(true)
+    ghRest('/github/reaction', {
+      method: 'POST',
+      body: {
+        kind: target,
+        content,
+        ...(commentId ? { comment_id: Number(commentId) } : { number: Number(number) }),
+        path: folder
+      }
+    })
+      .then(res => {
+        if (res && res.ok === true && Array.isArray(res.reactions)) {
+          setRows(res.reactions)
+
+          return
+        }
+        setRows(before)
+        host.notify({ kind: 'error', message: ghWriteFailure(res, 'The reaction did not change.') })
+      })
+      .catch(err => {
+        setRows(before)
+        host.notify({ kind: 'error', message: `The reaction did not change: ${ghReason(err)}` })
+      })
+      .then(() => setBusy(false))
+  }
+
+  return jsxs('div', {
+    style: S.ghReactions,
+    children: [
+      ...model.map(row => jsx(GhReactionChip, { busy, onToggle: toggle, row }, row.content)),
+      jsxs(DropdownMenu, {
+        children: [
+          jsx(DropdownMenuTrigger, {
+            asChild: true,
+            children: jsx('button', {
+              'aria-label': 'Add a reaction',
+              className: 'pcc-gh-reaction pcc-gh-reaction-add',
+              disabled: busy,
+              style: S.ghReactionAdd,
+              title: 'Add a reaction',
+              type: 'button',
+              children: '+'
+            })
+          }),
+          jsx(DropdownMenuContent, {
+            align: 'start',
+            children: picker.map(item =>
+              jsx(DropdownMenuItem, {
+                onSelect: () => toggle(item.content),
+                children: [
+                  jsx('span', { style: S.ghReactionGlyph, children: item.glyph }),
+                  jsx('span', { children: item.label }),
+                  mine.has(item.content)
+                    ? jsx(Codicon, { name: 'check', size: '0.75rem', style: { marginLeft: 'auto' } })
+                    : null
+                ]
+              }, item.content)
+            )
+          })
+        ]
+      })
+    ]
+  })
+}
+
+// The modal's Link to session door: the sessions the board already links to
+// this number, then the option to start one in the project folder. It opens or
+// seeds a composer; it never sends a turn.
+function GhLinkSessionMenu({ detail, folder, kind, number, owner, repo }) {
+  const links = useBoardLinks()
+  const lanes = useValue($lanes)
+  const statuses = useValue($statuses)
+  const matched = useMemo(() => ghLinkedSessions(links, kind, number), [links, kind, number])
+  const text = useMemo(
+    () => ghCommentDraftText({ author: detail && detail.author, body: detail && detail.body, number, owner, repo }),
+    [detail, number, owner, repo]
+  )
+  const path = String(folder || '').trim()
+  const [busy, setBusy] = useState(false)
+
+  const laneFor = link => {
+    const projectLane = statuses ? statuses[link.project_id] : ''
+
+    return resolveSessionLane(link, null, projectLane, laneIds(lanes))
+  }
+
+  const settle = (promise, failure) => {
+    if (busy) return
+    setBusy(true)
+    promise
+      .then(ok => {
+        if (!ok) host.notify({ kind: 'info', message: 'The session opened, but the thread text did not reach the composer.' })
+      })
+      .catch(err => host.notify({ kind: 'error', message: `${failure}: ${err && err.message ? err.message : err}` }))
+      .then(() => setBusy(false))
+  }
+
+  const openExisting = link => {
+    if (!link || !link.session_id) return
+    settle(openLinkedSession(link.session_id, text), 'Could not open the session')
+  }
+
+  const startNew = () => {
+    if (!path || busy) return
+    settle(openSessionInFolder(path, text), 'Could not open a session')
+  }
+
+  return jsxs(DropdownMenu, {
+    children: [
+      jsx(DropdownMenuTrigger, {
+        asChild: true,
+        children: jsxs(Button, {
+          'aria-label': 'Link to session',
+          disabled: busy,
+          size: 'xs',
+          title: path ? 'Open a session about this thread' : 'No project folder to open a session in',
+          variant: 'outline',
+          children: [
+            jsx(Codicon, { name: busy ? 'loading' : 'comment-discussion', size: '0.75rem', spinning: busy }),
+            busy ? 'Opening' : 'Link to session'
+          ]
+        })
+      }),
+      jsx(DropdownMenuContent, {
+        align: 'end',
+        children: [
+          jsx('div', { style: S.ghLinkGroup, children: 'Linked sessions' }),
+          matched.length > 0
+            ? matched.map(link => {
+                const lane = laneFor(link)
+
+                return jsx(DropdownMenuItem, {
+                  onSelect: () => openExisting(link),
+                  children: jsxs('span', {
+                    style: S.ghLinkRow,
+                    children: [
+                      jsxs('span', {
+                        style: S.ghLinkText,
+                        children: [
+                          jsx('span', { style: S.ghLinkTitle, children: link.title || link.session_id }),
+                          lane ? jsx(LaneBadge, { lane, lanes }) : null
+                        ]
+                      }),
+                      jsx(Codicon, { name: 'arrow-right', size: '0.75rem', style: { marginLeft: 'auto', flex: 'none' } })
+                    ]
+                  })
+                }, link.session_id)
+              })
+            : jsx('div', {
+                style: S.ghLinkEmpty,
+                children: kind === 'pr'
+                  ? 'No session is linked to this pull request yet.'
+                  : 'No session is linked to this issue yet.'
+              }),
+          jsx(Separator, {}),
+          jsx('div', { style: S.ghLinkGroup, children: 'Start one' }),
+          jsx(DropdownMenuItem, {
+            disabled: !path || busy,
+            onSelect: startNew,
+            children: [
+              jsx(Codicon, { name: 'add', size: '0.75rem' }),
+              path
+                ? 'Open new session'
+                : 'No project folder for this repo — cannot open a session.'
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function GhComment({ comment, decorate, folder, kind, number, refKey }) {
   const at = ageText(comment.created_at)
 
   return jsxs('div', {
@@ -4790,7 +5228,14 @@ function GhComment({ comment, decorate, refKey }) {
             style: S.ghProse,
             children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(comment.body) })
           })
-        : jsx('div', { style: S.ghQuiet, children: 'No comment text.' })
+        : jsx('div', { style: S.ghQuiet, children: 'No comment text.' }),
+      jsx(GhReactions, {
+        commentId: comment.id,
+        folder,
+        kind,
+        number,
+        reactions: comment.reactions
+      })
     ]
   })
 }
@@ -4995,7 +5440,13 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
                 style: S.ghProse,
                 children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(detail.body) })
               })
-            : jsx('div', { style: S.ghQuiet, children: 'No description.' })
+            : jsx('div', { style: S.ghQuiet, children: 'No description.' }),
+          jsx(GhReactions, {
+            folder,
+            kind,
+            number,
+            reactions: detail.reactions
+          })
         ]
       }),
       reviews.length > 0
@@ -5015,7 +5466,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
           head('comment', 'Comments', comments.length),
           comments.length > 0
             ? comments.map((comment, i) =>
-                jsx(GhComment, { comment, decorate, refKey }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
+                jsx(GhComment, { comment, decorate, folder, kind, number, refKey }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
               )
             : jsx('div', { style: S.ghQuiet, children: 'No comments yet.' })
         ]
@@ -5159,6 +5610,9 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
                         type: 'button',
                         children: ['View on GitHub', jsx(Codicon, { name: 'link-external', size: '0.6875rem' })]
                       })
+                    : null,
+                  detail
+                    ? jsx(GhLinkSessionMenu, { detail, folder, kind, number, owner, repo })
                     : null
                 ]
               }),

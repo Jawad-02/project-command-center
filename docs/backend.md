@@ -11,7 +11,7 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `GET /git/graph?path=<abs>&limit=200&refresh=0` | `root`, `fingerprint`, `limit` (50..500), `truncated`, `head: {sha, branch, detached}`, `default_branch`, `commits: [{sha, short, parents, author, authored_at, committed_at, subject, is_head}]`, `refs: [{name, short, kind, sha, upstream, ahead, behind, gone, is_head, is_remote}]`, `refs_outside` |
 | `GET /git/commit/{sha}?path=<abs>` | one commit: metadata, `diff_base` (`first_parent` or `root`), `on_remote`, `stats`, `files: [{path, old_path, status, additions, deletions, binary, truncated, hunks: [{header, old_start, old_lines, new_start, new_lines, lines: [[op, text]]}]}]`, `truncated`, `truncated_reason` |
 | `GET /github?path=<abs>&state=all&limit=50&refresh=0` | `states`, `issues[]`, `prs[]`, `counts`. Issue rows carry `state` and `state_reason`; PR rows carry `state`, `draft` and `merged` |
-| `GET /github/issue/{n}` / `GET /github/pr/{n}` | one item: body, comments, reviews, checks, labels, assignees, linked items, `author_avatar`, `author_bot` |
+| `GET /github/issue/{n}` / `GET /github/pr/{n}` | one item: body, comments, reviews, checks, labels, assignees, linked items, `author_avatar`, `author_bot`. The body and each of the first 30 comments carry `reactions: [{content, count, mine}]`; a reactions read that fails is `[]` for that object only |
 | `GET /github/refs?path=<abs>&numbers=1,2,3` | `refs` keyed by number, up to 50 in one batched GraphQL call |
 | `GET /github/counts?path=<abs>&path=<abs>...` | open issue and PR counts for up to 50 folders in one query, one alias per repository |
 | `GET /icon?path=<abs>&refresh=0` | the best mark for a project folder: a local favicon or logo, then a declared homepage favicon or the GitHub owner avatar, then a stack glyph |
@@ -29,6 +29,7 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `POST /github/pr/{n}/comment` | `{body}` | comments on a PR conversation |
 | `POST /github/issue/{n}/state` | `{state}` | opens or closes an issue |
 | `POST /github/pr/{n}/state` | `{state}` | opens or closes a PR |
+| `POST /github/reaction` | `{kind, number?, comment_id?, path?, content}` | toggles one reaction on `issue`, `pr`, `issue_comment` or `review_comment` as the `gh` account; `content` is one of `+1`, `-1`, `laugh`, `hooray`, `confused`, `heart`, `rocket`, `eyes`. Answers `{ok, reactions, toggled}`; refusals are 200 with `bad_kind`, `bad_content`, `gh_unavailable` or `gh_error` |
 | `POST /board/status` | `{project_id, status, note, session_id?, scope?}` | sets a project lane, or a session's lane when a session is named |
 | `POST /board/link` | `{session_id, project_id, issue?, pr?, pr_url?}` | links a session to its work item |
 | `POST /board/projects` | `{project_id, label, paths}` | records a project and its folders |

@@ -405,3 +405,22 @@ test('a click on a nested control never opens the card session', () => {
   assert.match(menu, /onClick: event => \{[\s\S]*onMove\(card, lane\.id\)/, 'the lane row moves on click')
   assert.match(menu, /onSelect: \(\) => onMove\(card, lane\.id\)/, 'and on the menu callback')
 })
+
+test('column folding: empty lanes fold, unfiled and backlog start folded', () => {
+  const source = readFileSync(PLUGIN, 'utf8')
+  const start = source.indexOf('function laneCollapsed(')
+  const end = source.indexOf('\n}\n', start)
+  const body = source.slice(start, end + 3)
+  const defaults = source.match(/const KANBAN_COLLAPSED_DEFAULT = \[([^\]]+)\]/)[1]
+  const list = defaults.split(',').map(s => s.trim().replace(/'/g, '')).filter(Boolean)
+  const laneCollapsed = new Function('KANBAN_COLLAPSED_DEFAULT', `${body}; return laneCollapsed`)(list)
+
+  assert.deepEqual(list, ['unfiled', 'backlog'], 'the two idle lanes start folded')
+  assert.equal(laneCollapsed('unfiled', {}, true), true, 'unfiled starts folded even with cards')
+  assert.equal(laneCollapsed('backlog', {}, false), true, 'an empty lane folds')
+  assert.equal(laneCollapsed('active', {}, true), false, 'a lane with cards is open')
+  assert.equal(laneCollapsed('active', {}, false), true, 'empty folds regardless of lane')
+  assert.equal(laneCollapsed('active', { active: false }, false), false, 'an explicit choice wins')
+  assert.equal(laneCollapsed('active', { active: true }, true), true, 'including folding a full lane')
+  assert.equal(laneCollapsed('unfiled', { unfiled: false }, true), false, 'unfiled can be opened')
+})

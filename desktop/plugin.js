@@ -68,6 +68,10 @@ const LIVE_MS = 5000
 const STATUS_KEY = 'projectStatus.v1'
 // Lane labels and order for the session kanban, kept apart from the store's ids.
 const LANES_KEY = 'sessionLanes.v1'
+// Explicit column collapse choices; the default and the empty rule live in code.
+const COLLAPSE_KEY = 'kanbanCollapsed.v1'
+// Lanes that start folded: the two a working session is never in.
+const KANBAN_COLLAPSED_DEFAULT = ['unfiled', 'backlog']
 const SORT_KEY = 'projectSort.v1'
 const OPEN_KEY = 'openProject.v1'
 // Every session a project has, not a preview window: the Projects view renders
@@ -883,6 +887,40 @@ function writeLanes(next) {
 // One lane read shared by the status page and the project detail page. A 404
 // (or any failure) leaves the stored copy in charge, which is exactly the older
 // backend's five defaults; the page never blocks on the route.
+// Explicit collapse choices: `{laneId: boolean}`. Absent ids follow the rule
+// (unfiled and backlog folded, an empty lane folded) rather than being stored,
+// so a lane that fills up opens itself without a write.
+function readCollapsed() {
+  try {
+    const raw = pluginCtx && pluginCtx.storage ? pluginCtx.storage.get(COLLAPSE_KEY, null) : null
+
+    if (!raw || typeof raw !== 'object') return {}
+
+    const out = {}
+
+    for (const [id, value] of Object.entries(raw)) if (typeof value === 'boolean') out[id] = value
+
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeCollapsed(next) {
+  if (!pluginDisposed && pluginCtx) pluginCtx.storage.set(COLLAPSE_KEY, next)
+}
+
+const $collapsed = atom(readCollapsed())
+
+function laneCollapsed(id, explicit, hasCards) {
+  const chosen = explicit ? explicit[id] : undefined
+
+  if (typeof chosen === 'boolean') return chosen
+  if (!hasCards) return true
+
+  return KANBAN_COLLAPSED_DEFAULT.includes(id)
+}
+
 function useLaneTable() {
   const query = useQuery({
     queryFn: () => boardRest('/board/lanes'),
@@ -9040,6 +9078,7 @@ function buildKanbanCard(input) {
     title,
     projectId,
     projectLabel: projectId ? String((project && project.label) || projectId) : 'No project',
+    folder: String(source.folder || '').trim(),
     branch: String(source.branch || '').trim() || 'main',
     issue: Number.isFinite(rawIssue) && rawIssue > 0 ? rawIssue : 0,
     pr: Number.isFinite(rawPr) && rawPr > 0 ? rawPr : 0,
@@ -9457,6 +9496,51 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
   })
 }
 
+// The project this card belongs to, with its own mark: the same door the board
+// uses (a local image, a stack glyph, then the initial), and a click that goes to
+// the project page rather than the session. A card with no project says so.
+function KanbanProjectTag({ card, onOpenProject }) {
+  const icon = useProjectIcon(card.folder)
+  const mark =
+    icon && icon.kind === 'image' && icon.data_url
+      ? jsx('img', {
+          alt: '',
+          decoding: 'async',
+          src: icon.data_url,
+          style: { borderRadius: 3, flex: 'none', height: 14, objectFit: 'contain', width: 14 }
+        })
+      : jsx(Codicon, {
+          name: (icon && icon.kind === 'glyph' && STACK_GLYPH[String(icon.stack || '')]) || 'project',
+          size: '0.75rem',
+          style: { color: 'var(--ui-text-quaternary)', flex: 'none' }
+        })
+  const box = { alignItems: 'center', display: 'inline-flex', gap: 5, maxWidth: '100%', minWidth: 0 }
+
+  if (!card.projectId) {
+    return jsxs('span', { style: { ...box, color: 'var(--ui-text-quaternary)' }, children: [mark, 'No project'] })
+  }
+
+  return jsxs('button', {
+    'aria-label': `Open ${card.projectLabel}`,
+    className: 'pcc-link',
+    onClick: event => {
+      if (event && event.stopPropagation) event.stopPropagation()
+      onOpenProject(card.projectId)
+    },
+    style: {
+      ...box,
+      background: 'transparent',
+      border: 0,
+      color: 'var(--ui-text-tertiary)',
+      cursor: 'pointer',
+      font: 'inherit',
+      padding: 0
+    },
+    type: 'button',
+    children: [mark, jsx('span', { style: S.ellipsis, children: card.projectLabel })]
+  })
+}
+
 function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpenProject, onOpenSession, state }) {
   return jsxs('div', {
     'aria-label': `${card.title}. ${laneLabel(card.lane, lanes)} lane.`,
@@ -9503,7 +9587,7 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
       jsxs('div', {
         style: S.kcardMeta,
         children: [
-          jsx('span', { style: S.ellipsis, children: card.projectLabel }, 'project'),
+          jsx(KanbanProjectTag, { card, onOpenProject }, 'project'),
           jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }, 'branch'),
           jsx(KanbanRefChip, { card }, 'refs'),
           card.linked
@@ -9525,7 +9609,7 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
   })
 }
 
-function KanbanColumn({ cards, count, dropLane, dragId, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, states }) {
+function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onToggle, states }) {
   const over = dropLane === lane.id
 
   return jsxs('div', {
@@ -9536,8 +9620,32 @@ function KanbanColumn({ cards, count, dropLane, dragId, lanes, lane, onDragEnd, 
       jsx('div', {
         style: S.colHeader,
         children: jsxs('div', {
-          style: S.row,
+          style: { ...S.row, cursor: 'pointer' },
+          // The header is the collapse control, and it stays a drop target, so a
+          // lane you collapsed is still a place you can put a card.
+          onClick: () => {
+            if (typeof onToggle === 'function') onToggle(lane.id)
+          },
+          onDragOver: event => event.preventDefault(),
+          onDrop: event => {
+            event.preventDefault()
+            onDrop(lane.id)
+          },
+          role: 'button',
+          tabIndex: 0,
+          'aria-expanded': collapsed ? 'false' : 'true',
+          onKeyDown: event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              if (typeof onToggle === 'function') onToggle(lane.id)
+            }
+          },
           children: [
+            jsx(Codicon, {
+              name: collapsed ? 'chevron-right' : 'chevron-down',
+              size: '0.75rem',
+              style: { color: 'var(--ui-text-quaternary)', flex: 'none' }
+            }, 'chevron'),
             jsx('span', {
               'aria-hidden': 'true',
               style: { ...S.kdot, marginTop: 0, background: laneColor(lane.id, lanes) }
@@ -9555,7 +9663,9 @@ function KanbanColumn({ cards, count, dropLane, dragId, lanes, lane, onDragEnd, 
           ]
         })
       }),
-      jsxs('div', {
+      collapsed
+        ? null
+        : jsxs('div', {
         onDragLeave: event => {
           if (!event.currentTarget.contains(event.relatedTarget)) onDragOver('')
         },
@@ -9699,7 +9809,7 @@ function KanbanTable({ cards, direction, lanes, onMove, onOpenProject, onOpenSes
 
 // Both views take the same filtered list and the same move handler; only the
 // arrangement changes.
-function KanbanViews({ byLane, counts, direction, dragCard, dropLane, lanes, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onSortLane, states, view }) {
+function KanbanViews({ byLane, collapsed, counts, direction, dragCard, dropLane, lanes, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onSortLane, onToggleCollapse, states, view }) {
   if (view === 'table') {
     const all = []
 
@@ -9723,6 +9833,7 @@ function KanbanViews({ byLane, counts, direction, dragCard, dropLane, lanes, onD
         KanbanColumn,
         {
           cards: byLane.get(lane.id) || [],
+          collapsed: laneCollapsed(lane.id, collapsed, (byLane.get(lane.id) || []).length > 0),
           count: counts[lane.id] || 0,
           dragId: dragCard ? dragCard.id : '',
           dropLane,
@@ -9735,6 +9846,7 @@ function KanbanViews({ byLane, counts, direction, dragCard, dropLane, lanes, onD
           onMove,
           onOpenProject,
           onOpenSession,
+          onToggle: onToggleCollapse,
           states
         },
         lane.id
@@ -9850,6 +9962,7 @@ function SessionsKanbanPage({ embedded }) {
   const [spin, setSpin] = useState(false)
   const laneState = useLaneTable()
   const ordered = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const collapsedLanes = useValue($collapsed)
   const { boardState, cards, live, projects, sessionsQuery } = useSessionCards(ordered)
 
   // A lane deleted while this tab was open leaves cards pointing at it; the
@@ -9881,6 +9994,18 @@ function SessionsKanbanPage({ embedded }) {
   const move = (card, status) => {
     if (!card || !card.projectId || !card.sessionId || card.lane === status) return
     writeSessionLane(card.projectId, card.sessionId, status)
+  }
+
+  // A click folds or unfolds one column and remembers that choice, so the next
+  // visit keeps it even after the lane fills up or empties again.
+  const toggleLane = laneId => {
+    if (!laneId) return
+    const next = { ...collapsedLanes }
+    const hasCards = (byLane.get(laneId) || []).length > 0
+
+    next[laneId] = !laneCollapsed(laneId, collapsedLanes, hasCards)
+    $collapsed.set(next)
+    writeCollapsed(next)
   }
 
   const drop = laneId => {
@@ -9938,6 +10063,7 @@ function SessionsKanbanPage({ embedded }) {
   } else {
     body = jsx(KanbanViews, {
       byLane,
+      collapsed: collapsedLanes,
       counts,
       direction: laneDirection,
       dragCard,
@@ -9954,6 +10080,7 @@ function SessionsKanbanPage({ embedded }) {
       onOpenProject: openProject,
       onOpenSession: openSession,
       onSortLane: () => setLaneDirection(dir => -dir),
+      onToggleCollapse: toggleLane,
       states: live.byStored,
       view
     })

@@ -44,6 +44,9 @@ const kanbanBlock = slice('// session-kanban:begin', '// session-kanban:end')
 // view migration and the lane filter are the two page-level rules this suite
 // pins alongside the pure kanban helpers.
 const viewsBlock = slice('// merged-views:begin', '// merged-views:end')
+// The card builder calls the goal line model, so the pure goal block loads into the same context;
+// its own suite is tests/goals.test.mjs.
+const goalsBlock = slice('// session-goals:begin', '// session-goals:end')
 
 vm.runInThisContext(
   `${laneBlock}\n${kanbanBlock}\n${viewsBlock}\n;globalThis.__PCC_KANBAN__ = {
@@ -93,7 +96,7 @@ function fn(name) {
 }
 
 vm.runInThisContext(
-  `${fn('toMs')}\n${fn('stampMs')}\n${fn('sessionStamp')}\n${fn('buildKanbanCard')}
+  `${goalsBlock}\n${fn('toMs')}\n${fn('stampMs')}\n${fn('sessionStamp')}\n${fn('buildKanbanCard')}
 ;globalThis.__PCC_CARD__ = { buildKanbanCard, sessionStamp, stampMs }`,
   { filename: PLUGIN }
 )

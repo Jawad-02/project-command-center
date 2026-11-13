@@ -62,11 +62,19 @@ quiet line instead of a bare status. Only a malformed path is a 400.
 ``GET /diagnose`` reports folder, git, token presence, gh login and a labelled
 probe per credential, which is how "why is my repo not loading" gets answered
 from inside the gateway.
+``GET /goals?session_ids=<id,id,...>`` answers the ACTIVE ``/goal`` on up to 60
+sessions in one read, from ``hermes_cli.goals.load_goal`` (a local SQLite meta
+read, imported lazily inside the handler): one batched read per board poll
+instead of one ``session.control.read`` gateway round trip per card. Only an
+active goal is included, so a session with no goal (or a paused, done or
+cleared one) is absent; a missing or broken goals module is
+``code: goals_unavailable`` with HTTP 200, never a 500.
 
 Caching is one in process dict keyed by (owner, repo, endpoint, params) with a
 60 s TTL; with a token the board read revalidates with the stored ETag, and
 ``refresh=1`` bypasses it. Icon results use their own keys: a local image 300 s
-(folder, file path, mtime), a remote image 3600 s, a glyph 300 s.
+(folder, file path, mtime), a remote image 3600 s, a glyph 300 s. Session goals
+are keyed by their sorted id list and live 30 s; no failure is ever cached.
 """
 
 from __future__ import annotations
@@ -111,6 +119,11 @@ GH_TIMEOUT = 15.0  # the GraphQL PR pass is the slow gh call; everything else is
 HTTP_TIMEOUT = 10.0
 REPO_TTL = 20.0
 GITHUB_TTL = 60.0
+# A session's /goal is a local SQLite read (hermes_cli.goals.load_goal), so the batch is cheap but
+# not free: 60 sessions cost 60 meta reads. 30 s matches how often a goal can visibly change
+# (one turn), and the board poll is 15 s.
+GOALS_TTL = 30.0
+MAX_GOAL_SESSIONS = 60
 MAX_CACHED_ENTRIES = 256
 MAX_CONCURRENT_GITHUB_CALLS = 2
 # GitHub resolves one aliased pullRequest(number:) in roughly 0.6 s on a busy
@@ -4295,6 +4308,127 @@ async def icon(path: str = Query(..., description="Absolute path to the project 
                 "error": f"the icon for {folder.name} could not be resolved: {type(exc).__name__}"}
     result.setdefault("cached", False)
     return result
+
+
+# --- Session goals -----------------------------------------------------------
+#
+# A `/goal` lives per session in Hermes' own state.db (`hermes_cli.goals.load_goal`): a local SQLite
+# meta read, not a gateway RPC. This backend runs in the same venv as the gateway, so one batched
+# read here is the whole board's answer; calling `session.control.read` per card would be one
+# gateway round trip per session per poll. The goals module is imported lazily inside the handler
+# (a plugin-only process, or a Hermes build without goals, answers `goals_unavailable` instead of
+# failing to load), and one unreadable session is skipped, never an error for the rest.
+
+_GOAL_ACTIVE = "active"
+# A stored session id is `20261113_212605_66fa65`: letters, digits, `_`, `-`, `.` and `:`. Anything
+# else (a path, a URL, whitespace) is not an id this route will look up.
+_SESSION_ID_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _goal_ids(raw: Optional[str]) -> list[str]:
+    """The well formed session ids from a comma list, de-duplicated and capped in order."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw or "").split(","):
+        value = part.strip()
+        if not value or value in seen:
+            continue
+        if not _SESSION_ID_SHAPE.match(value) or ".." in value:
+            continue
+        seen.add(value)
+        ids.append(value)
+        if len(ids) >= MAX_GOAL_SESSIONS:
+            break
+    return ids
+
+
+def _goal_gate(gate: Any) -> dict[str, Any]:
+    """One quality gate's state, without its output tail: the card's hover names the command."""
+    exit_code = getattr(gate, "last_exit_code", None)
+    return {
+        "command": str(getattr(gate, "command", "") or ""),
+        "attempts": _int(getattr(gate, "attempts", 0)),
+        "last_exit_code": None if exit_code is None else _int(exit_code),
+    }
+
+
+def _goal_row(state: Any) -> Optional[dict[str, Any]]:
+    """The card's goal row, or None when this session has no ACTIVE goal.
+
+    Hermes tracks completion for the goal as a whole (the judge's verdict), not per criterion, so
+    `subgoals_done` stays 0 while the goal is active: this route never invents progress the app
+    does not record. The gates are the machine-checked evidence and travel with the row.
+    """
+    if state is None or str(getattr(state, "status", "") or "") != _GOAL_ACTIVE:
+        return None
+    subgoals = [str(item).strip() for item in (getattr(state, "subgoals", None) or [])
+                if str(item).strip()]
+    gates = [_goal_gate(gate) for gate in (getattr(state, "gates", None) or [])
+             if str(getattr(gate, "command", "") or "").strip()]
+    updated = getattr(state, "last_turn_at", 0) or getattr(state, "created_at", 0) or 0
+    return {
+        "title": str(getattr(state, "goal", "") or "").strip(),
+        "status": _GOAL_ACTIVE,
+        "turns_used": _int(getattr(state, "turns_used", 0)),
+        "max_turns": _int(getattr(state, "max_turns", 0)),
+        "subgoals": subgoals,
+        "subgoals_done": 0,
+        "gates": gates,
+        "updated_at": float(updated or 0.0),
+    }
+
+
+@router.get("/goals")
+def goals(session_ids: str = Query("", description="Comma separated session ids, capped at 60")
+          ) -> dict[str, Any]:
+    """The active goal on each of up to 60 sessions, in one read.
+
+    ``{"ok": true, "goals": {session_id: {title, status, turns_used, max_turns, subgoals,
+    subgoals_done, gates, updated_at}}}``. Only an ``active`` goal is included; a session with no
+    goal, a paused one, a done one and an unknown id are all simply absent, which is what makes the
+    card render no goal line. Ids that are not plain session-id shaped are dropped, not looked up.
+
+    ``ok: false, code: "goals_unavailable"`` is a missing or broken goals module (or every read
+    failing), never a 500: the Desktop shows one quiet note instead of a card-level error. A single
+    session that raises is skipped and the rest still answer.
+
+    ``def``, not ``async def``: ``load_goal`` is a blocking SQLite meta read per id, so FastAPI must
+    run this in the threadpool rather than on the gateway event loop. Answers are cached 30 s under
+    the sorted id list.
+    """
+    ids = _goal_ids(session_ids)
+    if not ids:
+        return {"ok": True, "goals": {}}
+    key: tuple[Any, ...] = ("goals", tuple(sorted(ids)))
+    cached = _cache_hit(key)
+    if cached is not None:
+        return cached
+    try:
+        from hermes_cli.goals import load_goal
+    except Exception as exc:
+        log.warning("goals: the Hermes goals module is unavailable: %s", exc)
+        return {"ok": False, "code": "goals_unavailable",
+                "error": "Goal status is unavailable because this Hermes build has no goals "
+                         "module to read."}
+    found: dict[str, Any] = {}
+    failures = 0
+    for session_id in ids:
+        try:
+            row = _goal_row(load_goal(session_id))
+        except Exception as exc:  # one unreadable session must not blank the whole board
+            failures += 1
+            log.debug("goals: %s could not be read: %s", session_id, exc)
+            continue
+        if row is not None:
+            found[session_id] = row
+    if failures == len(ids):
+        # Nothing could be read: answering "no goals" here would be a lie the UI believes.
+        log.warning("goals: every goal read failed (%d sessions)", failures)
+        return {"ok": False, "code": "goals_unavailable",
+                "error": "Goal status is unavailable because no session goal could be read."}
+    payload = {"ok": True, "goals": found}
+    _cache_put(key, payload, ttl=GOALS_TTL)
+    return payload
 
 
 # --- Board state -------------------------------------------------------------

@@ -17,6 +17,7 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `GET /icon?path=<abs>&refresh=0` | the best mark for a project folder: a local favicon or logo, then a declared homepage favicon or the GitHub owner avatar, then a stack glyph |
 | `GET /worktrees?path=<abs>` | `<mainRoot>`, `branch`, `isMain`, `detached`, `locked` per worktree, from `git worktree list --porcelain` |
 | `GET /board` | `statuses`, `links`, `projects`: the board state the Desktop half renders |
+| `GET /goals?session_ids=<id,id,...>` | the ACTIVE `/goal` on up to 60 sessions: `goals` keyed by session id, each with `title`, `status`, `turns_used`, `max_turns`, `subgoals`, `subgoals_done`, `gates`, `updated_at`. Sessions with no goal, a paused, done or cleared goal, and unknown ids are absent |
 | `GET /diagnose` | why a project reads as it does: auth route, which folders resolved, what was skipped |
 
 ## Write routes
@@ -52,6 +53,7 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | commit diff | root plus full sha | 600 s |
 | GitHub reads | path plus route parameters | 60 s |
 | icons | local: folder plus file plus mtime, remote: 3600 s, glyph: 300 s | 300 s to 3600 s |
+| session goals | sorted comma list of session ids (up to 60) | 30 s |
 
 `refresh=1` bypasses the cache on every route that has one. Failures are never cached.
 

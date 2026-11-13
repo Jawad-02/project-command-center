@@ -61,7 +61,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'review-fixes.2026-11-13T1822Z'
+const PLUGIN_BUILD = 'goal-visibility.2026-11-13T1900Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -1542,6 +1542,48 @@ function useBoardLinks() {
   return useMemo(() => (query.data && Array.isArray(query.data.links) ? query.data.links : []), [query.data])
 }
 
+// One batched read of the active /goal for every id on screen, never one per card: this route is a
+// local SQLite read in the plugin backend, while `session.control.read` is a gateway round trip per
+// session per poll. It rides the board poll (BOARD_MS) with the same failure policy as the other
+// reads: a missing route, a rejected call and `ok: false` all answer no goals, so a card renders no
+// goal line and the view header says once that goal status is unavailable. `failed` starts false
+// and only turns true once a read actually settles, so the note never flashes on first paint.
+function useSessionGoals(ids) {
+  const key = useMemo(() => goalReadKey(ids), [ids])
+  const query = useQuery({
+    enabled: key.length > 0,
+    queryFn: () => boardRest(`/goals?session_ids=${encodeURIComponent(key)}`),
+    queryKey: [QUERY_ROOT, 'goals', key],
+    refetchInterval: BOARD_MS,
+    retry: false,
+    staleTime: 8000
+  })
+  const payload = query.data && typeof query.data === 'object' ? query.data : null
+  const failed = Boolean(query.isFetched && (query.isError || !payload || payload.ok !== true))
+  // The raw rows by session id: a caller hands one to buildKanbanCard, which normalizes it, or a
+  // model (below) to a row that is already built.
+  const rows = useMemo(() => {
+    const found = payload && payload.ok === true && payload.goals && typeof payload.goals === 'object'
+      ? payload.goals
+      : {}
+
+    return found
+  }, [payload])
+  const models = useMemo(() => {
+    const out = {}
+
+    for (const [id, row] of Object.entries(rows)) {
+      const model = goalModel(row)
+
+      if (model) out[id] = model
+    }
+
+    return out
+  }, [rows])
+
+  return { failed, models, query, rows }
+}
+
 // project id → the issue and PR numbers a session is linked to, newest link last.
 function linksByProject(links) {
   const map = new Map()
@@ -2303,6 +2345,23 @@ const S = {
   // One item inside a meta line: it may shrink and ellipsis on its own width,
   // so the row keeps a single meta line instead of clipping a word in half.
   metaItem: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: '0 1 auto' },
+  // An active /goal, one line: the target glyph, a title that truncates, and tabular turn and
+  // criteria counts. It sits in a card's third line and in a row's meta line, so it never grows
+  // past the width it is given; the full title and the gates are in the hover.
+  goalMeta: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    minWidth: 0,
+    maxWidth: '100%',
+    fontSize: '0.6875rem',
+    lineHeight: 1.35,
+    color: 'var(--ui-text-tertiary)'
+  },
+  goalTitle: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: '0 1 auto' },
+  goalNum: { flex: 'none', fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary)', whiteSpace: 'nowrap' },
+  // The view header's one honesty note when GET /goals does not answer: no toast, no per-card mark.
+  goalNote: { fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)', whiteSpace: 'nowrap' },
   // The session lane badge: one 16px line box, so it sits inside a title line
   // whose own line-height already clears 16px and never grows the row it is in.
   laneBadge: {
@@ -3517,7 +3576,32 @@ function SortPicker({ sort }) {
   })
 }
 
-function SessionCard({ session, state, showProject, onOpen, lane }) {
+// One active /goal on one line: the target glyph, the title truncated by goalModel, the turn
+// budget and, only when the goal has criteria, how many are confirmed. The hover carries the full
+// title, the turn count and every gate's state. `data-pcc-noclick` is what keeps the card's own
+// click handler from opening the session when this line is the thing that was clicked: the goal
+// line is information, never a second door into the session.
+function GoalMeta({ goal }) {
+  if (!goal) return null
+
+  return jsx(Tip, {
+    label: goal.tip,
+    children: jsxs('span', {
+      'data-pcc-noclick': 'true',
+      style: S.goalMeta,
+      children: [
+        jsx(Codicon, { name: 'target', size: '0.6875rem', style: { flex: 'none' } }),
+        jsx('span', { style: S.goalTitle, children: goal.short }),
+        jsx('span', {
+          style: S.goalNum,
+          children: goalCounts(goal)
+        })
+      ]
+    })
+  })
+}
+
+function SessionCard({ session, state, showProject, onOpen, lane, goal }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
   const running = RUNNING.has(state)
@@ -3540,6 +3624,8 @@ function SessionCard({ session, state, showProject, onOpen, lane }) {
       jsxs('span', {
         style: S.cardMeta,
         children: [
+          // The goal leads the meta line: it is the one item that will not survive an overflow.
+          goal ? jsx(GoalMeta, { goal }, 'goal') : null,
           session.git_branch ? jsx(BranchChip, { branch: session.git_branch }) : null,
           showProject ? jsx('span', { style: S.metaItem, children: showProject }) : null,
           ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { style: S.metaItem, children: ageText(ms) }) }) : null,
@@ -3680,7 +3766,7 @@ function ProjectIdRow({ counts, liveCount }) {
   })
 }
 
-function ProjectColumn({ project, index, status, lane, laneRows, linkRows, refs, liveByStored, moved, onOpenProject, onOpenSession, links, counts, laneFilter }) {
+function ProjectColumn({ project, index, status, lane, laneRows, linkRows, refs, liveByStored, moved, onOpenProject, onOpenSession, links, counts, laneFilter, goalById }) {
   const recent = useMemo(() => recentSessions(project), [project])
   const cost = formatCost(project.totalCostUsd)
   // The badge for every row in this column, and the header line, come from the
@@ -3785,12 +3871,12 @@ function ProjectColumn({ project, index, status, lane, laneRows, linkRows, refs,
           })
         ]
       }),
-      jsx(ColumnBody, { project, shown, laneOf, liveByStored, onOpenSession })
+      jsx(ColumnBody, { project, shown, laneOf, liveByStored, onOpenSession, goalById })
     ]
   })
 }
 
-function ColumnBody({ project, shown, laneOf, liveByStored, onOpenSession }) {
+function ColumnBody({ project, shown, laneOf, liveByStored, onOpenSession, goalById }) {
   return jsx('div', {
     style: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', overflowX: 'hidden', scrollbarWidth: 'thin' },
     children: jsxs('div', {
@@ -3801,7 +3887,13 @@ function ColumnBody({ project, shown, laneOf, liveByStored, onOpenSession }) {
           : shown.map(s =>
               jsx(
                 SessionCard,
-                { lane: laneOf(s.id), onOpen: onOpenSession, session: s, state: liveByStored.get(s.id) },
+                {
+                  goal: (goalById && goalById[s.id]) || null,
+                  lane: laneOf(s.id),
+                  onOpen: onOpenSession,
+                  session: s,
+                  state: liveByStored.get(s.id)
+                },
                 s.id
               )
             )
@@ -8696,7 +8788,7 @@ function laneGroups(node) {
   return out
 }
 
-function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel }) {
+function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel, goal }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
   const running = RUNNING.has(state)
@@ -8721,6 +8813,7 @@ function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel })
       jsxs('span', {
         style: S.laneRowMeta,
         children: [
+          goal ? jsx(GoalMeta, { goal }, 'goal') : null,
           projectLabel ? jsx('span', { style: { ...S.metaItem, color: 'var(--ui-text-tertiary)' }, children: projectLabel }) : null,
           ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { style: S.metaItem, children: ageText(ms) }) }) : null,
           model ? jsx('span', { style: S.metaItem, children: model }) : null,
@@ -8802,6 +8895,17 @@ function ProjectDetailPage() {
 
   useProjectSync(treeProjects)
   const lanes = useMemo(() => (project ? laneGroups(project) : []), [project])
+  // One /goals read for this project's sessions, newest first: the detail rows and the lane panel
+  // take their line from it, so the page costs one request, not one per row.
+  const goalIds = useMemo(() => {
+    const rows = []
+
+    for (const group of lanes) for (const session of group.sessions || []) rows.push(session)
+    rows.sort((a, b) => sessionStamp(b) - sessionStamp(a))
+
+    return rows.map(session => session.id)
+  }, [lanes])
+  const goals = useSessionGoals(goalIds)
   const folderPath = useMemo(() => (project ? primaryPath(project) : ''), [project])
   const pageProjects = useMemo(() => (project ? [project] : []), [project])
   const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
@@ -8847,6 +8951,9 @@ function ProjectDetailPage() {
           projectLane,
           // An unknown branch is no chip: never the invented text "main".
           branch: sessionBranch(s, ''),
+          // The raw /goals row: buildKanbanCard normalizes it exactly as the Status board's cards
+          // are normalized, so one builder owns the line model.
+          goal: goals.rows[s.id] || null,
           now,
           lanes: laneRows
         })
@@ -8857,7 +8964,7 @@ function ProjectDetailPage() {
     }
 
     return kanbanPlaceCards(out, laneRows)
-  }, [lanes, linkBySession, projectRefs, project, projectId, projectLane, folderPath, laneRows, overrides])
+  }, [lanes, linkBySession, projectRefs, project, projectId, projectLane, folderPath, laneRows, overrides, goals.rows])
   const panelCounts = useMemo(() => kanbanCounts(panelCards, laneRows), [panelCards, laneRows])
   const panelByLane = useMemo(() => {
     const map = new Map(laneRows.map(lane => [lane.id, []]))
@@ -9113,6 +9220,9 @@ function ProjectDetailPage() {
                 children: [
                   jsx('span', { style: S.stripTitle, children: 'Sessions by lane' }),
                   detail.isFetching ? jsx(Codicon, { name: 'loading', size: '0.75rem', spinning: true }) : null,
+                  goals.failed && loadedCount > 0
+                    ? jsx('span', { style: S.goalNote, children: 'Goal status unavailable' })
+                    : null,
                   jsx('span', { style: S.grow }),
                   jsx(SegmentedControl, { onChange: setPanelMode, options: PANEL_MODES, sizing: 'content', value: panelMode }),
                   jsx('span', { style: S.count, children: loadedCount })
@@ -9177,7 +9287,13 @@ function ProjectDetailPage() {
                             : group.sessions.map(s =>
                                 jsx(
                                   DetailSessionRow,
-                                  { lane: laneOf(s.id), onOpen: openSession, session: s, state: live.byStored.get(s.id) },
+                                  {
+                                    goal: goals.models[s.id] || null,
+                                    lane: laneOf(s.id),
+                                    onOpen: openSession,
+                                    session: s,
+                                    state: live.byStored.get(s.id)
+                                  },
                                   s.id
                                 )
                               )
@@ -9364,6 +9480,17 @@ function ProjectsPage() {
 
     return { shown, total }
   }, [visible, laneFilter, laneForSession])
+  // One /goals read for the whole page, newest session first: every compact row under every
+  // column takes its line from this map, and a project the search hid costs no id at all.
+  const goalIds = useMemo(() => {
+    const rows = []
+
+    for (const project of visible) for (const session of recentSessions(project)) rows.push(session)
+    rows.sort((a, b) => sessionStamp(b) - sessionStamp(a))
+
+    return rows.map(session => session.id)
+  }, [visible])
+  const goals = useSessionGoals(goalIds)
 
   // The 15s background poll also sets isFetching, so the glyph would spin on its
   // own. Spin only for a click.
@@ -9419,6 +9546,7 @@ function ProjectsPage() {
             project: p,
             refs: refsByProject.get(p.id),
             status: statuses[p.id] || DEFAULT_STATUS,
+            goalById: goals.models,
             laneFilter
           },
           p.id
@@ -9436,6 +9564,9 @@ function ProjectsPage() {
           jsx('span', { style: S.count, children: tree.data ? `${countLabel} ${projects.length === 1 && !q ? 'project' : 'projects'}` : '' }),
           sessionCounts.total > 0
             ? jsx('span', { style: S.metricMono, children: `${sessionCounts.shown} of ${sessionCounts.total} sessions` })
+            : null,
+          goals.failed && sessionCounts.total > 0
+            ? jsx('span', { style: S.goalNote, children: 'Goal status unavailable' })
             : null,
           jsx('span', { style: S.grow }),
           jsx(SessionLaneFilter, { laneFilter, lanes: laneRows, onToggle: toggleLane }),
@@ -9533,6 +9664,110 @@ function useProjectBranches(projects) {
   return query.data && typeof query.data === 'object' ? query.data : EMPTY_BRANCHES
 }
 
+// session-goals:begin
+// The active-goal line, pure: one row from GET /goals in, the line model out. Every surface (the
+// kanban card, the table row, the project detail row, the project column row) renders this model,
+// so a truncated title or a turn count can never differ between them. No renderer, no imports:
+// the suites slice this block out and run it.
+const GOAL_IDS_LIMIT = 60
+const GOAL_TITLE_CHARS = 44
+
+function goalTitleShort(text, max = 44) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim()
+
+  if (flat.length <= max) return flat
+
+  // Cut on a word boundary so a truncation never leaves half a word, then one ellipsis.
+  const cut = flat.slice(0, Math.max(1, max - 1)).replace(/\s+\S*$/, '')
+
+  return `${(cut || flat.slice(0, Math.max(1, max - 1))).trimEnd()}…`
+}
+
+function goalGateState(gate) {
+  const code = gate && gate.last_exit_code
+
+  if (code === 0) return 'passed'
+  if (code === null || code === undefined) return 'pending'
+
+  return 'failed'
+}
+
+// A goal row is only a line when it has a title. `subgoals` may be the backend's list or a count;
+// `subgoals_done` is what Hermes records (0 while the goal is active, because the app tracks
+// completion for the goal, not per criterion) and is clamped to the count it is shown against.
+function goalModel(row) {
+  if (!row || typeof row !== 'object') return null
+
+  const title = String(row.title || '').replace(/\s+/g, ' ').trim()
+
+  if (!title) return null
+  const turns = Math.max(0, Number(row.turns_used) || 0)
+  const maxTurns = Math.max(0, Number(row.max_turns) || 0)
+  const subgoals = Array.isArray(row.subgoals) ? row.subgoals.length : Math.max(0, Number(row.subgoals) || 0)
+  const done = Math.min(Math.max(0, Number(row.subgoals_done) || 0), subgoals)
+  const gates = (Array.isArray(row.gates) ? row.gates : []).map(gate => ({
+    command: String((gate && gate.command) || ''),
+    state: goalGateState(gate)
+  }))
+  const passing = gates.filter(gate => gate.state === 'passed').length
+  const turnsText = maxTurns > 0 ? `${turns}/${maxTurns}` : String(turns)
+  const subgoalsText = subgoals > 0 ? `${done}/${subgoals}` : ''
+  const gateText = gates.length ? `${passing}/${gates.length} gates passing` : 'No gates'
+  const tip = [
+    title,
+    `${turnsText} turns`,
+    subgoals > 0 ? `${done}/${subgoals} criteria` : '',
+    gateText,
+    ...gates.map(gate =>
+      `${gate.state === 'passed' ? 'passed' : gate.state === 'failed' ? 'failed' : 'not run'}: ${gate.command}`
+    )
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  return {
+    done,
+    gateText,
+    gates,
+    maxTurns,
+    short: goalTitleShort(title, GOAL_TITLE_CHARS),
+    status: String(row.status || ''),
+    subgoals,
+    subgoalsText,
+    tip,
+    title,
+    turns,
+    turnsText
+  }
+}
+
+// The counts half of the line: turns always, criteria only when the goal has any. One function so
+// the card, the table and both row types cannot drift apart on what "4/20 · 1/3" means.
+function goalCounts(goal) {
+  if (!goal) return ''
+
+  return goal.subgoalsText ? `${goal.turnsText} · ${goal.subgoalsText}` : goal.turnsText
+}
+
+// The comma list one read sends: de-duplicated, capped at the backend's own 60, in the caller's
+// order (the views pass newest first, so the cap keeps the newest sessions' goals).
+function goalReadKey(ids) {
+  const out = []
+  const seen = new Set()
+
+  for (const raw of ids || []) {
+    const id = String(raw || '').trim()
+
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+    if (out.length >= GOAL_IDS_LIMIT) break
+  }
+
+  return out.join(',')
+}
+// session-goals:end
+
 // The card the filters, the columns and the table all read. Every field is a
 // plain value so the page never reaches back into three different payloads while
 // rendering one row.
@@ -9574,7 +9809,10 @@ function buildKanbanCard(input) {
     laneNote: lane.note || '',
     lastActivity,
     stale: lane.lane !== 'done' && lastActivity > 0 && now - lastActivity > KANBAN_STALE_MS,
-    linked: Boolean(link)
+    linked: Boolean(link),
+    // The session's ACTIVE /goal, as the one line the card renders. No goal is null, never a
+    // placeholder: a card with no goal must look exactly as it did before this feature.
+    goal: goalModel(source.goal)
   }
 }
 
@@ -10076,7 +10314,8 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
               )
             : null
         ]
-      })
+      }),
+      card.goal ? jsx(GoalMeta, { goal: card.goal }, 'goal') : null
     ]
   })
 }
@@ -10261,11 +10500,17 @@ function KanbanTable({ cards, direction, lanes, onMove, onOpenProject, onOpenSes
               {
                 children: [
                   jsx('td', {
-                    children: jsx('button', {
-                      className: 'pcc-link',
-                      onClick: () => onOpenSession(card.sessionId),
-                      type: 'button',
-                      children: card.title
+                    children: jsxs('div', {
+                      style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 },
+                      children: [
+                        jsx('button', {
+                          className: 'pcc-link',
+                          onClick: () => onOpenSession(card.sessionId),
+                          type: 'button',
+                          children: card.title
+                        }),
+                        card.goal ? jsx(GoalMeta, { goal: card.goal }) : null
+                      ]
                     })
                   }),
                   jsx('td', {
@@ -10492,11 +10737,23 @@ function SessionsKanbanPage() {
       ),
     [cards, projectFilter, search, sourceFilter, staleOnly, ordered]
   )
-  const counts = useMemo(() => kanbanCounts(filtered, ordered), [filtered, ordered])
+  // One /goals read per board poll for the cards actually on screen, newest session first (the
+  // backend caps at 60). The filter runs before the read, so a search that hides sessions also
+  // stops paying for their goals, and the read is never one per card.
+  const goalIds = useMemo(
+    () => [...filtered].sort((a, b) => b.lastActivity - a.lastActivity).map(card => card.sessionId),
+    [filtered]
+  )
+  const goals = useSessionGoals(goalIds)
+  const cardRows = useMemo(
+    () => filtered.map(card => ({ ...card, goal: goals.models[card.sessionId] || null })),
+    [filtered, goals.models]
+  )
+  const counts = useMemo(() => kanbanCounts(cardRows, ordered), [cardRows, ordered])
   const byLane = useMemo(() => {
     const map = new Map(ordered.map(lane => [lane.id, []]))
 
-    for (const card of filtered) {
+    for (const card of cardRows) {
       const list = map.get(card.lane)
 
       if (list) list.push(card)
@@ -10505,7 +10762,7 @@ function SessionsKanbanPage() {
     for (const list of map.values()) list.sort((a, b) => b.lastActivity - a.lastActivity)
 
     return map
-  }, [filtered, ordered])
+  }, [cardRows, ordered])
 
   // Every refusal is writeSessionLane's to explain, so this never returns quietly
   // on a card the move cannot name: it hands the empty id over and the toast says
@@ -10627,6 +10884,9 @@ function SessionsKanbanPage() {
         style: S.viewBar,
         children: [
           jsx('span', { style: S.count, children: countLabel }),
+          goals.failed && total > 0
+            ? jsx('span', { style: S.goalNote, children: 'Goal status unavailable' })
+            : null,
           jsx('span', { style: S.grow }),
           jsx(SegmentedControl, { onChange: setView, options: KANBAN_VIEWS, sizing: 'content', value: view }),
           jsx(LanesPopover, { lanes: ordered, live: laneState.live }),

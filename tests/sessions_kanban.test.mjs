@@ -60,6 +60,7 @@ vm.runInThisContext(
     kanbanCounts,
     sortKanbanCards,
     kanbanMoveBody,
+    laneIdIn,
     normalizeLaneTable,
     normalizeLaneFilter,
     laneFilterAllows,
@@ -423,4 +424,168 @@ test('column folding: empty lanes fold, unfiled and backlog start folded', () =>
   assert.equal(laneCollapsed('active', { active: false }, false), false, 'an explicit choice wins')
   assert.equal(laneCollapsed('active', { active: true }, true), true, 'including folding a full lane')
   assert.equal(laneCollapsed('unfiled', { unfiled: false }, true), false, 'unfiled can be opened')
+})
+
+// A folded lane is a rail, not an empty column: it keeps a name, a dot and a
+// count in a few dozen pixels, and it is still a click and a drop target.
+test('a folded lane renders as a rail and unfolds when a card lands on it', () => {
+  const source = readFileSync(PLUGIN, 'utf8')
+  const railWidth = Number(source.match(/const RAIL_WIDTH = (\d+)/)[1])
+  const railStyle = source.slice(source.indexOf('  columnRail: {'), source.indexOf('  railLabel: {'))
+  const labelStyle = source.slice(source.indexOf('  railLabel: {'), source.indexOf('  railCount: {'))
+  const column = source.slice(source.indexOf('function KanbanColumn('), source.indexOf('function KanbanTable('))
+  const folded = column.slice(column.indexOf('if (collapsed) {'), column.indexOf("  return jsxs('div', {\n    className: 'pcc-kcol'"))
+  const dropAt = source.indexOf('  const drop = laneId => {')
+  const drop = source.slice(dropAt, source.indexOf('  const refresh = () => {', dropAt))
+
+  assert.ok(railWidth >= 36 && railWidth <= 44, `the rail is a rail: ${railWidth}px`)
+  assert.match(railStyle, /flex: `0 0 \$\{RAIL_WIDTH\}px`/, 'the rail takes its own flex basis, not a column')
+  assert.match(labelStyle, /writingMode: 'vertical-rl'/, 'the label is laid out vertically, not resampled')
+  assert.match(labelStyle, /textOverflow: 'ellipsis'/, 'a long label truncates instead of overflowing')
+  assert.match(folded, /className: 'pcc-kcol pcc-krail'/, 'the folded column carries the rail class')
+  assert.match(folded, /style: S\.columnRail/, 'and the rail style')
+  assert.doesNotMatch(folded, /Badge/, 'the rail does not carry the system/custom badge')
+  assert.match(folded, /onDrop: event => \{[\s\S]*onDrop\(lane\.id\)/, 'the rail is still a drop target')
+  assert.match(folded, /onClick: toggle/, 'and a click target that unfolds it')
+  assert.match(drop, /laneCollapsed\(laneId, collapsedLanes, true\)[\s\S]*writeCollapsed\(next\)/, 'a drop unfolds the lane it landed in')
+})
+
+// A move is a WRITE, so it refuses an id the live table does not list instead of
+// relocating the card to whatever lane happens to be first. The helper that says
+// so is what writeSessionLane calls, and it has to exist: this suite loads the
+// block, so a reference to a helper nobody defined fails here rather than in the
+// renderer (the reported "clicking a lane does nothing" bug).
+test('a move names a lane the table lists, and nothing for one it does not', () => {
+  const lanes = K.normalizeKanbanLanes(K.KANBAN_LANES)
+
+  assert.equal(K.laneIdIn(lanes, 'review'), 'review')
+  assert.equal(K.laneIdIn(lanes, ' REVIEW '), 'review', 'case and space are the table\'s, not the caller\'s')
+  assert.equal(K.laneIdIn(lanes, 'nope'), '', 'a lane the table dropped is a refusal, not a fallback')
+  assert.equal(K.laneIdIn(lanes, ''), '')
+  assert.equal(K.laneIdIn(lanes, null), '')
+  assert.equal(K.laneIdIn([{ id: 'shipping', label: 'Shipping' }], 'shipping'), 'shipping', 'a custom lane is a lane')
+})
+
+test('the move guard, not the caller, is the one that explains a refusal', () => {
+  const start = source.indexOf('function writeSessionLane(')
+
+  assert.ok(start >= 0, 'writeSessionLane missing from desktop/plugin.js')
+  const block = source.slice(start, source.indexOf('\n}\n', start) + 3)
+
+  assert.doesNotMatch(block, /if \(!projectId \|\| !sessionId \|\| !lane\) return/, 'the silent guard is the bug')
+  assert.match(block, /if \(!projectId\) \{[\s\S]*?host\.notify\([\s\S]*?not linked to a project/, 'an unlinked session says so')
+  assert.match(block, /if \(!lane\) \{[\s\S]*?host\.notify\(/, 'a dropped lane says so')
+  assert.match(block, /laneFailure\(res\)/, 'a refusal surfaces the store\'s own error string')
+})
+
+// The folder rule the store already applies to an unlinked session, applied in
+// the page so the card can be moved before a link row exists.
+test('an unlinked session is placed by the nearest project folder that contains it', () => {
+  const start = source.indexOf('function projectForPath(')
+
+  assert.ok(start >= 0, 'projectForPath missing from desktop/plugin.js')
+  const block = source.slice(start, source.indexOf('\n}\n', start) + 3)
+  const projectForPath = vm.runInThisContext(`(() => { ${block}; return projectForPath })()`, { filename: PLUGIN })
+  const folders = [
+    { id: 'p_near', path: '/home/nyll/dev/sub' },
+    { id: 'p_far', path: '/home/nyll/dev' },
+    { id: 'p_other', path: '/home/nyll/other' }
+  ]
+
+  assert.equal(projectForPath(folders, '/home/nyll/dev/sub'), 'p_near')
+  assert.equal(projectForPath(folders, '/home/nyll/dev/sub/app/src'), 'p_near', 'the longest folder wins')
+  assert.equal(projectForPath(folders, '/home/nyll/dev/another'), 'p_far')
+  assert.equal(
+    projectForPath([{ id: 'p_near', path: '/home/nyll/dev/sub' }], '/home/nyll/dev/subway'),
+    '',
+    'a sibling name is not inside the folder'
+  )
+  assert.equal(projectForPath(folders, ''), '')
+  assert.equal(projectForPath(folders, null), '')
+})
+
+// The log has to name the build: without this line a stale copy in
+// desktop-plugins/ and a live one are indistinguishable in desktop.log.
+test('register logs the build stamp first, and the stamp sits with the constants', () => {
+  const build = source.match(/^const PLUGIN_BUILD = '([^']+)'$/m)
+
+  assert.ok(build, 'PLUGIN_BUILD is a plain constant')
+  assert.ok(build[1].length > 0)
+  const registerAt = source.indexOf('  register(ctx) {')
+
+  assert.ok(registerAt > 0, 'register missing')
+  const registerBody = source.slice(registerAt, registerAt + 1200)
+
+  assert.match(registerBody, /console\.error\('\[pcc\] build', PLUGIN_BUILD/, 'register names the build it is')
+})
+
+// The move itself, executed: the real writeSessionLane body with the REST door
+// stubbed. This is the path the card menu takes, so it pins both halves of the
+// fix: a move POSTs the session-scoped body, and every case that cannot post
+// says why instead of closing the menu onto nothing.
+test('a lane change posts, and a change that cannot post tells the user why', async () => {
+  const grab = name => {
+    const start = source.indexOf(`function ${name}(`)
+
+    assert.ok(start >= 0, `${name} missing from desktop/plugin.js`)
+
+    return source.slice(start, source.indexOf('\n}\n', start) + 3)
+  }
+
+  const harness = new Function(
+    '$lanes', '$sessionStatus', 'boardRest', 'kanbanMoveBody', 'laneIdIn', 'queryClient',
+    'host', 'laneLabel', 'QUERY_ROOT',
+    `${grab('laneFailure')}\n${grab('writeSessionLane')}\nreturn writeSessionLane`
+  )
+  const run = ({ projectId = 'p1', sessionId = 's1', status = 'review', lane = 'review', answer = { ok: true } } = {}) => {
+    const posted = []
+    const notices = []
+    const store = { value: {}, get() { return this.value }, set(v) { this.value = v } }
+
+    harness(
+      { get: () => K.KANBAN_LANES },
+      store,
+      (path, opts) => {
+        posted.push({ path, body: opts.body })
+
+        return Promise.resolve(answer)
+      },
+      K.kanbanMoveBody,
+      () => lane,
+      { invalidateQueries() {} },
+      { notify: message => notices.push(message) },
+      id => id,
+      'root'
+    )(projectId, sessionId, status)
+
+    return { notices, posted, store }
+  }
+
+  const ok = run()
+
+  assert.equal(ok.posted.length, 1, 'the move posts')
+  assert.deepEqual(ok.posted[0], {
+    path: '/board/status',
+    body: { project_id: 'p1', session_id: 's1', status: 'review', scope: 'session' }
+  })
+  assert.equal(ok.store.value.s1.status, 'review', 'the card moves before the answer lands')
+  assert.equal(ok.notices.length, 0)
+
+  const unlinked = run({ projectId: '' })
+
+  assert.equal(unlinked.posted.length, 0, 'an unlinked session cannot be posted')
+  assert.equal(unlinked.notices.length, 1, 'and the user is told')
+  assert.match(unlinked.notices[0].message, /not linked to a project yet/)
+
+  const dropped = run({ lane: '' })
+
+  assert.equal(dropped.posted.length, 0, 'a lane the table dropped is not posted')
+  assert.match(dropped.notices[0].message, /no "review" lane/)
+
+  const refused = run({ answer: { ok: false, code: 'project_mismatch', error: 'session s1 is carded under p2' } })
+
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(refused.notices.length, 1, 'a refusal is not silent')
+  assert.match(refused.notices[0].message, /carded under p2/, 'the store\'s own words reach the user')
+  assert.equal(refused.store.value.s1, undefined, 'and the card goes back')
 })

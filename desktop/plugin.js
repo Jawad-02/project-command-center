@@ -56,6 +56,12 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'project-command-center'
 const ROUTE = '/project-command-center'
+// The build this file is. `register()` logs it, so ~/.hermes/logs/desktop.log
+// answers "which plugin.js is the app running" with a grep instead of a guess:
+// the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
+// and a stale tab look identical from the outside. Bump this line on every
+// change worth telling apart in a bug report.
+const PLUGIN_BUILD = 'laneid-fix.2026-11-13T1715Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -80,6 +86,10 @@ const OPEN_KEY = 'openProject.v1'
 // own session_limit (2000) is the hard ceiling.
 const TREE_PREVIEW_LIMIT = 500
 const COLUMN_WIDTH = 340
+// A folded lane keeps its slot in the row, but as a rail: narrow enough that a
+// board of folded lanes reads as a row of names, wide enough for a legible
+// vertical label and a count.
+const RAIL_WIDTH = 40
 const COLUMN_GAP = 12
 // /board is the backend copy of the status map plus the session→issue/PR links.
 // The poll is slow on purpose: writes are optimistic and an event invalidates it.
@@ -372,6 +382,16 @@ function laneRowsFromResponse(payload) {
 
 function laneIds(lanes) {
   return normalizeLaneTable(lanes).map(lane => lane.id)
+}
+
+// The lane a WRITE names, or '' when the live table does not list it. `lanePlace`
+// answers with a fallback lane because a card has to render somewhere; a move has
+// no such luxury: an id the table no longer lists is a refusal, not a relocation,
+// and answering '' here is what lets the move say so instead of posting it.
+function laneIdIn(lanes, id) {
+  const value = typeof id === 'string' ? id.trim().toLowerCase() : ''
+
+  return value && laneIds(lanes).includes(value) ? value : ''
 }
 
 // A card in a lane the table no longer lists sits in the first lane: a column
@@ -1117,13 +1137,37 @@ function writeSessionLane(projectId, sessionId, status) {
   // the server would refuse it.
   const lane = laneIdIn($lanes.get(), status)
 
-  if (!projectId || !sessionId || !lane) return
+  // A move that cannot be posted says why. The menu closing onto nothing is the
+  // reported bug, so every refusal below is a message, never a bare return.
+  if (!sessionId) {
+    host.notify({ kind: 'warning', message: 'This card has no session id, so its lane cannot be saved.' })
+
+    return
+  }
+  if (!lane) {
+    host.notify({
+      kind: 'warning',
+      message: `The board has no "${status}" lane any more, so this card was not moved.`
+    })
+
+    return
+  }
+  if (!projectId) {
+    host.notify({
+      kind: 'warning',
+      message: 'This session is not linked to a project yet, so its lane cannot be saved. Add its folder as a project, then try again.'
+    })
+
+    return
+  }
   const at = Date.now()
 
   $sessionStatus.set({ ...$sessionStatus.get(), [sessionId]: { project_id: projectId, status: lane, at } })
   boardRest('/board/status', { method: 'POST', body: kanbanMoveBody(projectId, sessionId, lane) })
     .then(res => {
-      if (res && res.ok === false) throw new Error(String(res.error || 'The board refused the move.'))
+      // The route answers 200 with `ok: false` and its own reason (bad_status,
+      // unknown_project, project_mismatch), and that sentence is the useful one.
+      if (!res || res.ok === false) throw laneFailure(res)
       queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
     })
     .catch(err => {
@@ -1698,6 +1742,25 @@ function primaryPath(project) {
   return project.path || (project.repos && project.repos[0] && project.repos[0].path) || ''
 }
 
+// Which project a session belongs to when no link row names one: the longest
+// folder that contains the session's repo root, else its cwd. This is the store's
+// own rule for an unlinked session (`cwd_prefix`), applied here so a card can
+// still be moved instead of the menu failing silently. `folders` is a
+// longest-first list of `{ id, path }`, so the nearest project wins.
+function projectForPath(folders, path) {
+  const value = String(path || '').replace(/\/+$/, '')
+
+  if (!value || !Array.isArray(folders)) return ''
+
+  for (const entry of folders) {
+    const folder = String((entry && entry.path) || '').replace(/\/+$/, '')
+
+    if (folder && (value === folder || value.startsWith(`${folder}/`))) return String(entry.id || '')
+  }
+
+  return ''
+}
+
 function validColor(color) {
   if (!color || typeof color !== 'string') return null
   if (typeof CSS !== 'undefined' && CSS.supports && !CSS.supports('color', color)) return null
@@ -1788,6 +1851,11 @@ const CSS_TEXT = `
 .pcc-kcard:hover, .pcc-kcard:focus-visible { background: var(--chrome-action-hover); border-color: var(--ui-stroke-secondary); outline: none; }
 .pcc-kcard[data-dragging="true"] { opacity: 0.5; }
 .pcc-kcol[data-drop="true"] { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 6%, transparent); }
+.pcc-krail { border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); background: color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent); transition: background-color 120ms ease, border-color 120ms ease; }
+.pcc-krail:hover { background: color-mix(in srgb, var(--chrome-action-hover) 80%, transparent); border-color: var(--ui-stroke-secondary); }
+.pcc-krail:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -2px; }
+.pcc-krail[data-drop="true"] { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 12%, transparent); }
+@media (prefers-reduced-motion: reduce) { .pcc-krail { transition: none !important; } }
 .pcc-kempty { border: 1px dashed color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); border-radius: 8px; padding: 10px; font-size: 0.6875rem; color: var(--ui-text-quaternary); text-align: center; }
 .pcc-ktable th { text-align: left; font-weight: 500; font-size: 0.6875rem; color: var(--ui-text-quaternary); padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); position: sticky; top: 0; background: var(--ui-bg-elevated); }
 .pcc-ktable td { padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 28%, transparent); vertical-align: middle; }
@@ -1855,6 +1923,48 @@ const S = {
     borderBottom: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
     background: 'color-mix(in srgb, var(--ui-bg-elevated) 90%, transparent)',
     flex: 'none'
+  },
+  // The folded column: the same card, laid on its side. The label flows in a
+  // vertical writing mode rather than a rotated box, so Chromium renders the
+  // glyphs upright-on-their-side instead of resampling a rotated layer, and the
+  // rail keeps its own width instead of a full column's. Paint (background,
+  // border colour) lives in the .pcc-krail rule, not here: an inline background
+  // would outrank the :hover and data-drop states.
+  columnRail: {
+    position: 'relative',
+    boxSizing: 'border-box',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: 8,
+    width: RAIL_WIDTH,
+    flex: `0 0 ${RAIL_WIDTH}px`,
+    minHeight: 0,
+    padding: '10px 0',
+    borderRadius: 12,
+    cursor: 'pointer',
+    overflow: 'hidden'
+  },
+  railLabel: {
+    writingMode: 'vertical-rl',
+    textOrientation: 'mixed',
+    flex: '1 1 0',
+    minHeight: 0,
+    maxHeight: '100%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontSize: '0.8125rem',
+    fontWeight: 500,
+    lineHeight: 1.15,
+    color: 'var(--ui-text-secondary)'
+  },
+  // Upright on purpose: a number read at 90 degrees is a number you squint at.
+  railCount: {
+    flex: 'none',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-tertiary)',
+    fontVariantNumeric: 'tabular-nums'
   },
   row: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
   nameBtn: {
@@ -8422,7 +8532,7 @@ function ProjectDetailPage() {
     return map
   }, [panelCards, laneRows])
   const panelMove = (card, status) => {
-    if (!card || !card.projectId || !card.sessionId || card.lane === status) return
+    if (!card || !status || card.lane === status) return
     writeSessionLane(card.projectId, card.sessionId, status)
   }
   const panelDrop = laneId => {
@@ -9611,6 +9721,54 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
 
 function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onToggle, states }) {
   const over = dropLane === lane.id
+  const toggle = () => {
+    if (typeof onToggle === 'function') onToggle(lane.id)
+  }
+
+  // Folded, the lane is a rail: a column-width card turned on its side, so seven
+  // folded lanes are seven names in a row instead of seven empty columns. It
+  // keeps every behaviour the header had — click and Enter unfold, and a card
+  // dropped on it still lands in the lane (the page unfolds it so the card shows).
+  if (collapsed) {
+    return jsxs('div', {
+      'aria-expanded': 'false',
+      'aria-label': `${lane.label} lane, ${count} ${count === 1 ? 'session' : 'sessions'}, collapsed. Activate to expand.`,
+      className: 'pcc-kcol pcc-krail',
+      'data-drop': over ? 'true' : 'false',
+      onClick: toggle,
+      onDragLeave: event => {
+        if (!event.currentTarget.contains(event.relatedTarget)) onDragOver('')
+      },
+      onDragOver: event => {
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'move'
+        if (!over) onDragOver(lane.id)
+      },
+      onDrop: event => {
+        event.preventDefault()
+        onDrop(lane.id)
+      },
+      onKeyDown: event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          toggle()
+        }
+      },
+      role: 'button',
+      style: S.columnRail,
+      tabIndex: 0,
+      title: `${lane.label} · ${count}`,
+      children: [
+        jsx(
+          'span',
+          { 'aria-hidden': 'true', style: { ...S.kdot, marginTop: 0, background: laneColor(lane.id, lanes) } },
+          'dot'
+        ),
+        jsx('span', { className: 'pcc-krail-label', style: S.railLabel, children: lane.label }, 'label'),
+        jsx('span', { style: S.railCount, children: count }, 'count')
+      ]
+    })
+  }
 
   return jsxs('div', {
     className: 'pcc-kcol',
@@ -9623,9 +9781,7 @@ function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, 
           style: { ...S.row, cursor: 'pointer' },
           // The header is the collapse control, and it stays a drop target, so a
           // lane you collapsed is still a place you can put a card.
-          onClick: () => {
-            if (typeof onToggle === 'function') onToggle(lane.id)
-          },
+          onClick: toggle,
           onDragOver: event => event.preventDefault(),
           onDrop: event => {
             event.preventDefault()
@@ -9905,6 +10061,30 @@ function useSessionCards(lanes) {
     return out
   }, [treeProjects, boardProjects])
   const projectById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
+  // Every folder a project owns, longest first: a linked session names its
+  // project directly, an unlinked one is placed by where it ran, exactly as the
+  // store's own `cwd_prefix` resolution does it.
+  const projectFolders = useMemo(() => {
+    const out = []
+
+    for (const project of projects) {
+      if (!project || !project.id) continue
+
+      const paths = [
+        primaryPath(project),
+        ...(Array.isArray(project.paths) ? project.paths : []),
+        ...(Array.isArray(project.repos) ? project.repos.map(repo => repo && repo.path) : [])
+      ]
+
+      for (const path of paths) {
+        const folder = String(path || '').replace(/\/+$/, '')
+
+        if (folder) out.push({ id: String(project.id), path: folder })
+      }
+    }
+
+    return out.sort((a, b) => b.path.length - a.path.length)
+  }, [projects])
   const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
   const refsByProject = useProjectRefs(projects, boardState.links)
   const branches = useProjectBranches(projects)
@@ -9917,8 +10097,14 @@ function useSessionCards(lanes) {
 
     return rows.map(session => {
       const link = linkBySession.get(session.id) || null
-      const projectId = String((link && link.project_id) || '')
-      const project = projectId ? projectById.get(projectId) : null
+      const named = String((link && link.project_id) || '')
+      // No link row is not "no project": a session that ran inside a project's
+      // folder belongs to it, and naming that project here is what makes the
+      // card's lane writable (the store creates the missing link row on the POST).
+      const project = named
+        ? projectById.get(named) || null
+        : projectById.get(projectForPath(projectFolders, session.git_repo_root || session.cwd)) || null
+      const projectId = String(named || (project && project.id) || '')
       const folder = project ? primaryPath(project) : ''
       const refs = projectId ? refsByProject.get(projectId) : null
       const number = Number(link && link.pr)
@@ -9942,7 +10128,7 @@ function useSessionCards(lanes) {
 
       return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
     })
-  }, [sessionsQuery.data, linkBySession, projectById, refsByProject, statuses, branches, overrides, lanes])
+  }, [sessionsQuery.data, linkBySession, projectById, projectFolders, refsByProject, statuses, branches, overrides, lanes])
 
   return { boardState, cards, live, projectById, projects, sessionsQuery, tree }
 }
@@ -9991,8 +10177,11 @@ function SessionsKanbanPage({ embedded }) {
     return map
   }, [filtered, ordered])
 
+  // Every refusal is writeSessionLane's to explain, so this never returns quietly
+  // on a card the move cannot name: it hands the empty id over and the toast says
+  // which one is missing.
   const move = (card, status) => {
-    if (!card || !card.projectId || !card.sessionId || card.lane === status) return
+    if (!card || !status || card.lane === status) return
     writeSessionLane(card.projectId, card.sessionId, status)
   }
 
@@ -10013,7 +10202,16 @@ function SessionsKanbanPage({ embedded }) {
 
     setDragCard(null)
     setDropLane('')
-    if (card && laneId) move(card, laneId)
+    if (!card || !laneId) return
+    // A card dropped on a folded rail lands in a lane you can see: unfold it
+    // first, so the move is not silent into a 40px strip.
+    if (laneCollapsed(laneId, collapsedLanes, true)) {
+      const next = { ...collapsedLanes, [laneId]: false }
+
+      $collapsed.set(next)
+      writeCollapsed(next)
+    }
+    move(card, laneId)
   }
 
   const refresh = () => {
@@ -10254,6 +10452,12 @@ export default {
   name: 'Project Command Center',
   register(ctx) {
     pluginCtx = ctx
+    // First line of the registration: the log now names the build that is live.
+    // Electron keeps renderer console output at ERROR level only (see
+    // electron/renderer-log.ts: info and ordinary warnings are filtered), so the
+    // stamp rides console.error to be greppable in ~/.hermes/logs/desktop.log.
+    // The tag says it is a stamp, not a failure.
+    console.error('[pcc] build', PLUGIN_BUILD)
     // A reload re-registers this module: scheduling is armed again here, and a
     // promise that settles after teardown (a composer verb, a REST read) drops
     // its timer instead of writing into a retired lifetime set.

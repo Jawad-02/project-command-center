@@ -390,3 +390,18 @@ test('the filter predicate hides every unchecked lane and nothing else', () => {
   assert.equal(K.laneFilterAllows(null, 'active'), false)
   assert.equal(K.laneFilterAllows([], 'active'), false)
 })
+
+// A card is a click target for opening its session, and the menu lives inside
+// it. Regression: a lane row in that menu opened the session instead of moving
+// the card, so the card must ignore clicks that start on a nested control.
+test('a click on a nested control never opens the card session', () => {
+  const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
+  const card = source.slice(source.indexOf('function KanbanCard('), source.indexOf('function KanbanColumn('))
+  const menu = source.slice(source.indexOf('function KanbanCardMenu('), source.indexOf('function KanbanCard('))
+
+  assert.match(card, /target\.closest/, 'the card tests where the click started')
+  assert.match(card, /role="menuitem"/, 'menu rows are excluded')
+  assert.match(card, /data-pcc-noclick/, 'the trigger is excluded')
+  assert.match(menu, /onClick: event => \{[\s\S]*onMove\(card, lane\.id\)/, 'the lane row moves on click')
+  assert.match(menu, /onSelect: \(\) => onMove\(card, lane\.id\)/, 'and on the menu callback')
+})

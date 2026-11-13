@@ -3111,6 +3111,8 @@ function SortPicker({ sort }) {
       }),
       jsx(DropdownMenuContent, {
         align: 'end',
+        'data-pcc-noclick': 'true',
+        onClick: event => event.stopPropagation(),
         children: SORTS.map(s =>
           jsxs(
             DropdownMenuItem,
@@ -9377,7 +9379,9 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
         children: jsx('button', {
           'aria-label': `Actions for ${card.title}`,
           className: 'pcc-more',
+          'data-pcc-noclick': 'true',
           onClick: event => event.stopPropagation(),
+          onPointerDown: event => event.stopPropagation(),
           style: S.kmenuBtn,
           type: 'button',
           children: jsx(Codicon, { name: 'ellipsis', size: '0.875rem' })
@@ -9392,6 +9396,13 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
                 jsxs(
                   DropdownMenuItem,
                   {
+                    // `onSelect` is the menu's own callback; the click handler is
+                    // the belt for a host whose menu fires one but not the other.
+                    // `onMove` no-ops when the lane is already this one.
+                    onClick: event => {
+                      if (event && event.stopPropagation) event.stopPropagation()
+                      onMove(card, lane.id)
+                    },
                     onSelect: () => onMove(card, lane.id),
                     children: [
                       jsx(
@@ -9452,7 +9463,18 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
     className: 'pcc-kcard',
     'data-dragging': dragId === card.id ? 'true' : 'false',
     draggable: true,
-    onClick: () => onOpenSession(card.sessionId),
+    // The card opens its session, but the ellipsis menu, the lane rows and any
+    // other control inside it are not the card: a click that starts on one of
+    // them must do that control's job and nothing else.
+    onClick: event => {
+      const target = event && event.target
+
+      if (target && target.closest && target.closest('button, select, a, input, [role="menuitem"], [role="menu"], [data-pcc-noclick]')) {
+        return
+      }
+
+      onOpenSession(card.sessionId)
+    },
     onDragEnd,
     onDragStart: event => {
       event.dataTransfer.setData('text/plain', card.id)

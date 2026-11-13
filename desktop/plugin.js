@@ -1748,6 +1748,8 @@ const S = {
     minHeight: 0
   },
   panelBoard: { display: 'flex', flex: '1 1 0', minHeight: 240, maxHeight: 520, minWidth: 0 },
+  titleRow: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
+  titleIcon: { color: 'var(--ui-text-secondary)', flex: 'none' },
   title: { margin: 0, fontSize: '1rem', fontWeight: 600, color: 'var(--ui-text-primary)', lineHeight: 1.2 },
   count: { fontSize: '0.75rem', color: 'var(--ui-text-quaternary)', fontVariantNumeric: 'tabular-nums' },
   grow: { flex: '1 1 0', minWidth: 0 },
@@ -9603,7 +9605,13 @@ function ProjectCommandCenterPage() {
       jsxs('header', {
         style: S.header,
         children: [
-          jsx('h1', { style: S.title, children: 'Project Command Center' }),
+          jsxs('div', {
+            style: S.titleRow,
+            children: [
+              jsx(PillarIcon, { size: '18px', style: S.titleIcon }),
+              jsx('h1', { style: S.title, children: 'Project Command Center' })
+            ]
+          }),
           jsx('span', { style: S.grow }),
           jsx(ViewSwitcher, {})
         ]
@@ -9623,12 +9631,31 @@ function ProjectCommandCenterPage() {
 // it yet, so the area name is written out.
 const TITLEBAR_TOOL_AREA = 'titleBar.tools.right'
 
+// Material Design Icons "pillar" (mdi:pillar), inlined so the page needs no
+// Iconify dependency and no network read at render. MDI is Apache 2.0,
+// Pictogrammers; the path is unmodified. The sidebar nav cannot take this yet:
+// a nav contribution carries a codicon name, not an icon node.
+const PILLAR_PATH =
+  'M6 5h12a1 1 0 0 1 1 1a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1a1 1 0 0 1 1-1m15-3v2H3V2zm-6 6h2v14h-2zM7 8h2v14H7zm4 0h2v14h-2z'
+
+function PillarIcon({ size = '14px', style }) {
+  return jsx('svg', {
+    'aria-hidden': 'true',
+    fill: 'none',
+    height: size,
+    style: style || { display: 'block' },
+    viewBox: '0 0 24 24',
+    width: size,
+    children: jsx('path', { d: PILLAR_PATH, fill: 'currentColor' })
+  })
+}
+
 function titlebarTool() {
   return {
     id: 'pcc-open',
     label: 'Projects',
     title: 'Projects',
-    icon: jsx(Codicon, { name: 'project', size: '13.9px' }),
+    icon: jsx(PillarIcon, { size: '13.9px' }),
     to: ROUTE
   }
 }

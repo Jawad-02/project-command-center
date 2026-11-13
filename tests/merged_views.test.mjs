@@ -65,10 +65,10 @@ vm.runInThisContext(
     laneDeleteBody,
     laneOrderBody,
     addKanbanLane,
-    mergeKanbanOrder,
     laneColor,
     laneLabel,
-    laneUseCount,
+    laneUseCounts,
+    laneUseText,
     laneRowsFromResponse,
     kanbanLaneFor,
     kanbanCounts
@@ -141,7 +141,7 @@ test('the merged page renders one switcher over the two views', () => {
   assert.match(block, /useValue\(\$view\)/, 'the page must read the view atom')
   assert.match(block, /jsx\(ViewSwitcher, \{\}\)/, 'the page must render the switcher')
   assert.match(block, /view === 'status'/, 'the page must branch to Status')
-  assert.match(block, /jsx\(ProjectsPage, \{ embedded: true \}\)/, 'everything else is the Projects board')
+  assert.match(block, /jsx\(ProjectsPage, \{\}\)/, 'everything else is the Projects board')
   assert.doesNotMatch(block, /branches|issues/, 'no view may still branch on the removed ids')
 
   const switcher = source.slice(source.indexOf('function ViewSwitcher()'), source.indexOf('\n}\n', source.indexOf('function ViewSwitcher()')) + 3)
@@ -273,11 +273,23 @@ test('create, rename, order and delete build the bodies the routes document', ()
   assert.deepEqual(M.laneDeleteBody('blocked'), { id: 'blocked' })
 })
 
-test('adding twice keeps both columns: the slug gets a numeric suffix', () => {
-  const once = M.addKanbanLane(M.laneTableOrDefaults(null), 'Needs design')
+test('the slug is the server rule: 24 characters, a leading letter, no suffix', () => {
+  const long = M.addKanbanLane(M.laneTableOrDefaults(null), `aaaa ${'b'.repeat(40)}`)
+  const id = long[long.length - 1].id
+
+  assert.equal(id.length, 24, 'the id is the route\'s 24-character cut')
+  assert.match(id, /^[a-z][a-z0-9-]*$/, 'the id starts with a letter')
+  assert.equal(M.laneSlug('3d printing'), '', 'a digit-first label has no id the route would accept')
+  assert.equal(M.laneSlug('---'), '', 'a label with no letters or digits has no id')
+})
+
+test('adding twice leaves one column: the route refuses the duplicate id', () => {
+  const table = M.laneTableOrDefaults(null)
+  const once = M.addKanbanLane(table, 'Needs design')
   const twice = M.addKanbanLane(once, 'Needs design')
 
-  assert.deepEqual(M.laneIds(twice).slice(-2), ['needs-design', 'needs-design-2'])
+  assert.deepEqual(M.laneIds(twice), M.laneIds(once), 'no suffixed id is invented client side')
+  assert.equal(M.laneIds(twice).filter(lane => lane === 'needs-design').length, 1)
 })
 
 test('the reassign retry ride on the delete body', () => {
@@ -339,13 +351,15 @@ test('a system lane offers no delete control, only rename and reorder', () => {
   assert.match(block, /children: 'system'/, 'the row labels the system lanes')
 })
 
-test('lane_in_use counts read from any of the shapes the route may carry', () => {
-  assert.equal(M.laneUseCount(4, 'done'), 4)
-  assert.equal(M.laneUseCount({ done: 3 }, 'done'), 3)
-  assert.equal(M.laneUseCount({ done: { count: 2 } }, 'done'), 2)
-  assert.equal(M.laneUseCount({ done: { sessions: 5 } }, 'done'), 5)
-  assert.equal(M.laneUseCount({ total: 6 }, 'done'), 6)
-  assert.equal(M.laneUseCount(null, 'done'), 0)
+test('lane_in_use counts read the route\'s own project_status and links fields', () => {
+  assert.deepEqual(M.laneUseCounts({ project_status: 2, links: 3 }), { projects: 2, sessions: 3 })
+  assert.deepEqual(M.laneUseCounts({ links: 4 }), { projects: 0, sessions: 4 })
+  assert.deepEqual(M.laneUseCounts({ project_status: 1 }), { projects: 1, sessions: 0 })
+  assert.deepEqual(M.laneUseCounts(null), { projects: 0, sessions: 0 })
+  assert.equal(M.laneUseText('Review', { projects: 2, sessions: 3 }), '3 sessions and 2 projects use Review.')
+  assert.equal(M.laneUseText('Review', { projects: 0, sessions: 1 }), '1 session uses Review.')
+  assert.equal(M.laneUseText('Review', { projects: 1, sessions: 0 }), '1 project uses Review.')
+  assert.equal(M.laneUseText('Review', { projects: 0, sessions: 0 }), 'Review still has sessions.')
 })
 
 // ── the projects view's session rendering ──────────────────────────────────
@@ -409,4 +423,82 @@ test('the project page session panel offers By branch and By lane', () => {
   assert.match(block, /jsx\(KanbanViews, \{/, 'the lane mode renders the kanban')
   assert.match(block, /lanes: laneRows/, 'the columns are the server lane table')
   assert.match(block, /onMove: panelMove/, 'a move in the panel is a real move')
+})
+
+// ── the low-severity review items, each pinned where it lives ──────────────
+
+test('D16: laneFailure maps the route\'s own project_status and links onto the error', () => {
+  const begin = source.indexOf('function laneFailure(')
+  const block = source.slice(begin, source.indexOf('\n}\n', begin) + 3)
+
+  assert.match(block, /err\.counts = laneUseCounts\(res\)/, 'the route shape is mapped, not read as res.counts')
+  assert.doesNotMatch(block, /res\.counts/, 'the message key the route never sends is gone')
+})
+
+test('D17: a created lane keeps its provisional column, and only the route refuses a duplicate', () => {
+  assert.match(source, /provisionalLanes\.add\(added\.id\)/, 'the optimistic id is marked provisional')
+  assert.match(source, /withProvisionalLanes\(serverRows\)/, 'a reread merges the provisional row back in')
+  assert.match(source, /provisionalLanes\.delete\(added\.id\)/, 'the marker dies when the POST settles')
+  assert.match(source, /laneSlug\(text\) \? 'lane_exists' : 'bad_label'/, 'a duplicate is the route\'s refusal')
+})
+
+test('D18: a session list at the read limit says newest, not the whole history', () => {
+  assert.match(source, /const SESSION_LIST_LIMIT = 200/, 'the read limit is one constant')
+  assert.match(source, /limit: SESSION_LIST_LIMIT/, 'the read uses it')
+  assert.match(source, /total >= SESSION_LIST_LIMIT[\s\S]{0,80}newest \$\{total\} sessions/, 'the count is honest at the limit')
+})
+
+test('D19: the dead helpers and the duplicate style keys are gone', () => {
+  assert.doesNotMatch(source, /function kanbanLane\(/, 'kanbanLane had no caller')
+  assert.doesNotMatch(source, /function mergeKanbanOrder\(/, 'mergeKanbanOrder had no caller')
+  const styleBlock = source.slice(source.indexOf('const S = {'), source.indexOf('\n}\n', source.indexOf('const S = {')))
+  const keys = [...styleBlock.matchAll(/^ {2}([A-Za-z0-9_]+):/gm)].map(match => match[1])
+
+  assert.equal(new Set(keys).size, keys.length, 'no later S key silently overrides an earlier one')
+  assert.doesNotMatch(source, /collapsed\s*\?\s*'chevron-right'/, 'the expanded column has no folded branch')
+  assert.doesNotMatch(source, /catch\(err => \{\s*throw err\s*\}\)/, 'the empty rethrow catch is gone')
+})
+
+test('D20: a disabled lane control says why it cannot act', () => {
+  assert.match(source, /title: card\.projectId \? undefined : 'A lane cannot be saved without a project/, 'the table select explains its disabled state')
+  assert.match(source, /Lanes cannot be removed while the board backend is not answering/, 'a dead backend is the tip, not Remove X')
+})
+
+test('D21: an unknown branch draws no chip, never the invented main', () => {
+  assert.doesNotMatch(source, /\|\| 'main'/, 'no branch falls back to main')
+  assert.match(source, /function sessionBranch\(preview, projectBranch\)/, 'the branch reader owns the empty case')
+})
+
+test('D23: the projects view and the detail rows read the pending-move cache', () => {
+  const column = source.slice(source.indexOf('function ProjectColumn('), source.indexOf('\n}\n', source.indexOf('function ProjectColumn(')))
+  const detail = source.slice(source.indexOf('function ProjectDetailPage('), source.indexOf('\nconst panelCounts', source.indexOf('function ProjectDetailPage(')))
+
+  assert.match(column, /movedLane\(moved, id, laneForLink/, 'a project column row applies a posted move')
+  assert.match(detail, /movedLane\(overrides, id, laneForLink/, 'a detail row applies a posted move')
+  assert.match(detail, /lane: move\.status, laneSource: 'user'/, 'the lane panel card applies the same move')
+})
+
+test('D24: openSession answers whether the tab opened, and the draft waits for it', () => {
+  const begin = source.indexOf('function openLinkedSession(')
+  const block = source.slice(begin, source.indexOf('\n}\n', begin) + 3)
+
+  assert.match(source, /\.then\(\(\) => true\)[\s\S]{0,400}return false/, 'openSession resolves true or false')
+  assert.match(block, /return openSession\(sessionId\)\.then\(opened => \{/, 'the draft is chained to the open')
+  assert.match(block, /if \(!opened\) return false/, 'a failed open stops before the composer')
+})
+
+test('the pages are only ever rendered inside the merged page, so the flag is gone', () => {
+  assert.doesNotMatch(source, /function ProjectsPage\(\{ embedded \}\)/)
+  assert.doesNotMatch(source, /function SessionsKanbanPage\(\{ embedded \}\)/)
+  assert.doesNotMatch(source, /embedded \?/)
+  assert.match(source, /jsx\(SessionsKanbanPage, \{\}\)/)
+})
+
+test('one .pcc-link rule carries the button reset the table used to repeat inline', () => {
+  assert.match(source, /\.pcc-link \{ border: 0; background: transparent; color: inherit; font: inherit; padding: 0; cursor: pointer; text-align: left;/, 'the class owns the reset')
+
+  const table = source.slice(source.indexOf('function KanbanTable('), source.indexOf('\n}\n', source.indexOf('function KanbanTable(')))
+
+  assert.doesNotMatch(table, /style: \{\s*border: 0,/, 'the table buttons carry the class, not the inline reset')
+  assert.equal((table.match(/className: 'pcc-link'/g) || []).length, 2)
 })

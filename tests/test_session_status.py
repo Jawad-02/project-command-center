@@ -507,6 +507,48 @@ def main() -> int:
           and (board_body.get("auto_link") or {}).get("lane", {}).get("scope") == "session",
           str(board_body.get("auto_link")))
 
+    # The auto_link cwd is the server process's own folder, never the session's,
+    # so the route may not name it `cwd_prefix`.
+    response = client.get("/board", params={"session_id": "s-route-cwd"})
+    cwd_auto = (response.json().get("auto_link") or {})
+    print(f"  GET /board cwd: via={cwd_auto.get('via')} project={cwd_auto.get('project_id')}")
+    check("GET /board never labels the server's cwd as the session's",
+          cwd_auto.get("via") != "cwd_prefix", str(cwd_auto))
+    check("a cwd-resolved project is named server_cwd",
+          cwd_auto.get("project_id") != "pcc" or cwd_auto.get("via") == "server_cwd", str(cwd_auto))
+
+    # The live cwd here is the sandbox's, so no project matches it. Drive the
+    # rule directly with a store that answers from the cwd branch.
+    import agent.runtime_cwd as runtime_cwd
+    original_cwd = runtime_cwd.resolve_agent_cwd
+    runtime_cwd.resolve_agent_cwd = lambda: PLUGIN
+
+    class CwdStore:
+        def resolve_link(self, session_id):
+            return "", None
+
+        def resolve_project(self, session_id=None, explicit=None, use_cwd=True):
+            return "pcc"
+
+        def get_status(self, project_id):
+            return {"status": "active"}
+
+        def resolve_lane(self, link, status, ids):
+            return {"status": (status or {}).get("status", ""), "scope": "project",
+                    "source": "user", "note": "", "updated_at": None}
+
+        def lane_ids(self):
+            return list(store.lane_ids())
+
+    try:
+        cwd_only = api._auto_link(CwdStore(), "s-cwd-only")
+    finally:
+        runtime_cwd.resolve_agent_cwd = original_cwd
+    print(f"  auto_link cwd branch: {cwd_only.get('via')}")
+    check("a cwd match is named server_cwd, and the answer says it is not the session's folder",
+          cwd_only.get("via") == "server_cwd" and cwd_only.get("project_id") == "pcc",
+          str(cwd_only))
+
     print(f"\n{'PASS' if not FAILURES else 'FAIL'}: {len(FAILURES)} failure(s)")
     if FAILURES:
         for name in FAILURES:

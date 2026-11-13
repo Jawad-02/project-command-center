@@ -51,7 +51,6 @@ vm.runInThisContext(
     KANBAN_LANE_IDS,
     KANBAN_STALE_MS,
     KANBAN_SOURCE_TEXT,
-    kanbanLane,
     normalizeKanbanLanes,
     renameKanbanLane,
     moveKanbanLane,
@@ -63,6 +62,7 @@ vm.runInThisContext(
     sessionIndex,
     sessionProjectId,
     sessionBranch,
+    movedLane,
     laneIdIn,
     normalizeLaneTable,
     normalizeLaneFilter,
@@ -307,6 +307,16 @@ test('a session with no link row is placed by the tree sessionIds claim, with it
   assert.equal(K.sessionBranch(join.previewById.get('s2'), ''), '')
   assert.equal(K.sessionBranch(null, ''), '')
   assert.equal(built.lastActivity !== C.stampMs(session.started_at), true)
+
+  // A move this client posted wins over the lane the last board read carries,
+  // and an id with no pending move keeps its resolved lane untouched.
+  const resolved = { lane: 'active', note: '', source: 'project' }
+
+  assert.deepEqual(K.movedLane({ s1: { status: 'done' } }, 's1', resolved),
+    { lane: 'done', note: '', source: 'user' })
+  assert.equal(K.movedLane({ s1: { status: 'done' } }, 's2', resolved), resolved)
+  assert.equal(K.movedLane({}, 's1', resolved), resolved)
+  assert.equal(K.movedLane(null, 's1', resolved), resolved)
 })
 
 test('a card carries the folder its project mark reads, and the mark has one chain', () => {

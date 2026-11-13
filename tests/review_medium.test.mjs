@@ -373,7 +373,11 @@ function openLinkedRun(draft, opts = {}) {
     false,
     () => true,
     [10],
-    id => calls.push(['openSession', id])
+    id => {
+      calls.push(['openSession', id])
+
+      return Promise.resolve(opts.open !== false)
+    }
   )('s1', 'Reply to #12')
 
   return { calls, notices, promise }
@@ -418,6 +422,14 @@ test('D12: a build without insertText refuses instead of wiping the draft', asyn
   assert.equal(await run.promise, false)
   assert.equal(run.calls.some(call => call[0] === 'setDraft'), false, 'the unsent text is never replaced')
   assert.equal(run.notices.length, 0, 'the caller shows its own note when the text did not land')
+})
+
+test('D24: a session that fails to open never claims the text missed the composer', async () => {
+  const run = openLinkedRun('', { open: false })
+
+  assert.equal(await run.promise, false, 'the failure is the call\'s answer')
+  assert.deepEqual(run.calls, [['openSession', 's1']], 'nothing touched the composer after a failed open')
+  assert.equal(run.notices.length, 0, 'openSession owns the one message; no second sentence follows')
 })
 
 // D13 - an Error has no `.error` field, so the old reader answered "the request

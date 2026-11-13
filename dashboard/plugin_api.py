@@ -4357,7 +4357,11 @@ def _auto_link(store: Any, session_id: Optional[str]) -> dict[str, Any]:
     elif link and (link.get("project_id") or "") == resolved:
         via = "session_link"
     else:
-        via = "cwd_prefix"
+        # `resolve_agent_cwd()` answers this process's own folder. Under
+        # `hermes serve` that is the gateway's cwd, not the asking session's, so
+        # this match is a server-side guess and the name says so: no caller may
+        # read it as the session's folder.
+        via = "server_cwd"
     # The same rule the renderer applies: the session's own lane wins, else the project's.
     lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None,
                               store.lane_ids())

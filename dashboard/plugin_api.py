@@ -63,12 +63,15 @@ quiet line instead of a bare status. Only a malformed path is a 400.
 probe per credential, which is how "why is my repo not loading" gets answered
 from inside the gateway.
 ``GET /goals?session_ids=<id,id,...>`` answers the ACTIVE ``/goal`` on up to 60
-sessions in one read, from ``hermes_cli.goals.load_goal`` (a local SQLite meta
-read, imported lazily inside the handler): one batched read per board poll
-instead of one ``session.control.read`` gateway round trip per card. Only an
-active goal is included, so a session with no goal (or a paused, done or
-cleared one) is absent; a missing or broken goals module is
-``code: goals_unavailable`` with HTTP 200, never a 500.
+sessions in one read: one batched read per board poll instead of one
+``session.control.read`` gateway round trip per card. It reads the persisted
+``state_meta`` row through the PUBLISHED plugin API (``hermes_state``, a
+documented whole-module surface in ``hermes_cli/data/plugin_api.json``) with
+``SessionDB(read_only=True)`` — never a private core import (catalog rule 9) and
+never a second writer beside the gateway's registry handle. Only an active goal
+is included, so a session with no goal (or a paused, done or cleared one) is
+absent; an unreadable state database is ``code: goals_unavailable`` with
+HTTP 200, never a 500.
 
 Caching is one in process dict keyed by (owner, repo, endpoint, params) with a
 60 s TTL; with a token the board read revalidates with the stored ETag, and
@@ -119,8 +122,8 @@ GH_TIMEOUT = 15.0  # the GraphQL PR pass is the slow gh call; everything else is
 HTTP_TIMEOUT = 10.0
 REPO_TTL = 20.0
 GITHUB_TTL = 60.0
-# A session's /goal is a local SQLite read (hermes_cli.goals.load_goal), so the batch is cheap but
-# not free: 60 sessions cost 60 meta reads. 30 s matches how often a goal can visibly change
+# A session's /goal is a read-only `state_meta` lookup on the state database, so the batch is cheap
+# but not free: 60 sessions cost 60 meta reads. 30 s matches how often a goal can visibly change
 # (one turn), and the board poll is 15 s.
 GOALS_TTL = 30.0
 MAX_GOAL_SESSIONS = 60
@@ -4312,14 +4315,33 @@ async def icon(path: str = Query(..., description="Absolute path to the project 
 
 # --- Session goals -----------------------------------------------------------
 #
-# A `/goal` lives per session in Hermes' own state.db (`hermes_cli.goals.load_goal`): a local SQLite
-# meta read, not a gateway RPC. This backend runs in the same venv as the gateway, so one batched
-# read here is the whole board's answer; calling `session.control.read` per card would be one
-# gateway round trip per session per poll. The goals module is imported lazily inside the handler
-# (a plugin-only process, or a Hermes build without goals, answers `goals_unavailable` instead of
-# failing to load), and one unreadable session is skipped, never an error for the rest.
+# A `/goal` lives per session in Hermes' own state.db: one `state_meta` row per session, keyed
+# `goal:<session id>`, whose value is the goal state as JSON (`hermes_cli.goals` writes it, and
+# `GoalState.from_json` is the only reader that interprets it). This route reads that row through
+# the PUBLISHED plugin API instead of importing core internals: `hermes_state` is a documented
+# whole-module surface (`hermes_cli/data/plugin_api.json`, rendered in
+# `developer-guide/plugins/public-api.md`), and `SessionDB(read_only=True)` opens a `mode=ro` pool,
+# so it can never become a second writer beside the gateway's registry handle — the duplicate-writer
+# shape `hermes_cli.goals` itself warns about. Catalog rule 9 ("public surfaces only") is why this
+# is not `from hermes_cli.goals import load_goal`.
+#
+# Why not `session.control.read`, the other public read of this same state? It resolves a LIVE
+# session (`tui_gateway/session_registry.py::_sess_nowait` looks the id up in the in-memory table)
+# and the gateway keys that table by a minted runtime id (`uuid4().hex[:8]`, see
+# `methods_session.py::_new_runtime_ids`), while a board card carries the STORED id from
+# `session.list`. The gateway docs are explicit that these polls never restore a cold session
+# ("use `session.resume` first"), so the renderer would get `4001` for every card — the goal line
+# would vanish from the board. One batched persisted read is both public and correct here.
+#
+# The row's shape is not trusted: it is parsed and type-checked here, and a row that is not a JSON
+# object (or has no string `status`) reads as no goal for that session, exactly as an unparseable
+# row did when `load_goal` parsed it. One unreadable session is skipped, never an error for the rest.
 
 _GOAL_ACTIVE = "active"
+# `hermes_cli.goals._meta_key`: the state_meta key holding one session's goal JSON.
+_GOAL_META_PREFIX = "goal:"
+# `GoalState.max_turns`' default (hermes_cli.goals.DEFAULT_MAX_TURNS), for rows that predate the field.
+_GOAL_DEFAULT_MAX_TURNS = 20
 # A stored session id is `20261113_212605_66fa65`: letters, digits, `_`, `-`, `.` and `:`. Anything
 # else (a path, a URL, whitespace) is not an id this route will look up.
 _SESSION_ID_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -4342,35 +4364,70 @@ def _goal_ids(raw: Optional[str]) -> list[str]:
     return ids
 
 
-def _goal_gate(gate: Any) -> dict[str, Any]:
+def _goal_db() -> Any:
+    """A read-only handle on this home's state.db, through the published ``hermes_state`` module.
+
+    One handle per request, closed in the route's ``finally``: a read-only open costs about 4 ms and
+    a request only builds one on a cache miss, while a long-lived handle would pin a read connection
+    (and its permit) for the life of the process. ``read_only=True`` skips the writer open entirely —
+    no mkdir, no token writer thread, no close-time checkpoint.
+    """
+    from hermes_state import SessionDB
+
+    return SessionDB(read_only=True)
+
+
+def _goal_state(db: Any, session_id: str) -> Optional[dict[str, Any]]:
+    """The persisted goal for one session, parsed, or None when the session has none.
+
+    ``db.get_meta`` raises for an unreadable database (the caller counts that as a failed read);
+    a missing row, unparseable JSON and a non-object row are all "no goal", which is what makes the
+    card render no goal line.
+    """
+    raw = db.get_meta(f"{_GOAL_META_PREFIX}{session_id}")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        log.warning("goals: could not parse the stored goal for %s: %s", session_id, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _goal_gate(gate: dict[str, Any]) -> dict[str, Any]:
     """One quality gate's state, without its output tail: the card's hover names the command."""
-    exit_code = getattr(gate, "last_exit_code", None)
+    exit_code = gate.get("last_exit_code")
     return {
-        "command": str(getattr(gate, "command", "") or ""),
-        "attempts": _int(getattr(gate, "attempts", 0)),
+        "command": str(gate.get("command") or ""),
+        "attempts": _int(gate.get("attempts")),
         "last_exit_code": None if exit_code is None else _int(exit_code),
     }
 
 
-def _goal_row(state: Any) -> Optional[dict[str, Any]]:
+def _goal_row(data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """The card's goal row, or None when this session has no ACTIVE goal.
 
     Hermes tracks completion for the goal as a whole (the judge's verdict), not per criterion, so
     `subgoals_done` stays 0 while the goal is active: this route never invents progress the app
     does not record. The gates are the machine-checked evidence and travel with the row.
     """
-    if state is None or str(getattr(state, "status", "") or "") != _GOAL_ACTIVE:
+    if not isinstance(data, dict) or str(data.get("status", _GOAL_ACTIVE) or "") != _GOAL_ACTIVE:
         return None
-    subgoals = [str(item).strip() for item in (getattr(state, "subgoals", None) or [])
-                if str(item).strip()]
-    gates = [_goal_gate(gate) for gate in (getattr(state, "gates", None) or [])
-             if str(getattr(gate, "command", "") or "").strip()]
-    updated = getattr(state, "last_turn_at", 0) or getattr(state, "created_at", 0) or 0
+    raw_subgoals = data.get("subgoals")
+    subgoals = ([item.strip() for item in raw_subgoals
+                 if isinstance(item, str) and item.strip()]
+                if isinstance(raw_subgoals, list) else [])
+    raw_gates = data.get("gates")
+    gates = ([_goal_gate(gate) for gate in raw_gates
+              if isinstance(gate, dict) and str(gate.get("command") or "").strip()]
+             if isinstance(raw_gates, list) else [])
+    updated = data.get("last_turn_at") or data.get("created_at") or 0
     return {
-        "title": str(getattr(state, "goal", "") or "").strip(),
+        "title": str(data.get("goal") or "").strip(),
         "status": _GOAL_ACTIVE,
-        "turns_used": _int(getattr(state, "turns_used", 0)),
-        "max_turns": _int(getattr(state, "max_turns", 0)),
+        "turns_used": _int(data.get("turns_used")),
+        "max_turns": _int(data.get("max_turns") or _GOAL_DEFAULT_MAX_TURNS),
         "subgoals": subgoals,
         "subgoals_done": 0,
         "gates": gates,
@@ -4388,13 +4445,13 @@ def goals(session_ids: str = Query("", description="Comma separated session ids,
     goal, a paused one, a done one and an unknown id are all simply absent, which is what makes the
     card render no goal line. Ids that are not plain session-id shaped are dropped, not looked up.
 
-    ``ok: false, code: "goals_unavailable"`` is a missing or broken goals module (or every read
-    failing), never a 500: the Desktop shows one quiet note instead of a card-level error. A single
-    session that raises is skipped and the rest still answer.
+    ``ok: false, code: "goals_unavailable"`` is an unreadable state database (or every read failing),
+    never a 500: the Desktop shows one quiet note instead of a card-level error. A single session
+    that raises is skipped and the rest still answer.
 
-    ``def``, not ``async def``: ``load_goal`` is a blocking SQLite meta read per id, so FastAPI must
-    run this in the threadpool rather than on the gateway event loop. Answers are cached 30 s under
-    the sorted id list.
+    ``def``, not ``async def``: each goal is a blocking SQLite meta read, so FastAPI must run this in
+    the threadpool rather than on the gateway event loop. Answers are cached 30 s under the sorted id
+    list.
     """
     ids = _goal_ids(session_ids)
     if not ids:
@@ -4404,23 +4461,29 @@ def goals(session_ids: str = Query("", description="Comma separated session ids,
     if cached is not None:
         return cached
     try:
-        from hermes_cli.goals import load_goal
+        db = _goal_db()
     except Exception as exc:
-        log.warning("goals: the Hermes goals module is unavailable: %s", exc)
+        log.warning("goals: the Hermes state database is unavailable: %s", exc)
         return {"ok": False, "code": "goals_unavailable",
-                "error": "Goal status is unavailable because this Hermes build has no goals "
-                         "module to read."}
+                "error": "Goal status is unavailable because this Hermes build has no readable "
+                         "state database."}
     found: dict[str, Any] = {}
     failures = 0
-    for session_id in ids:
+    try:
+        for session_id in ids:
+            try:
+                row = _goal_row(_goal_state(db, session_id))
+            except Exception as exc:  # one unreadable session must not blank the whole board
+                failures += 1
+                log.debug("goals: %s could not be read: %s", session_id, exc)
+                continue
+            if row is not None:
+                found[session_id] = row
+    finally:
         try:
-            row = _goal_row(load_goal(session_id))
-        except Exception as exc:  # one unreadable session must not blank the whole board
-            failures += 1
-            log.debug("goals: %s could not be read: %s", session_id, exc)
-            continue
-        if row is not None:
-            found[session_id] = row
+            db.close()
+        except Exception:  # a read-only handle that cannot close is already spent
+            log.debug("goals: the read-only state.db handle did not close cleanly", exc_info=True)
     if failures == len(ids):
         # Nothing could be read: answering "no goals" here would be a lie the UI believes.
         log.warning("goals: every goal read failed (%d sessions)", failures)

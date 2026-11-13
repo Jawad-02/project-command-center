@@ -2,14 +2,15 @@
 """The /goals route: one batched read of each session's ACTIVE /goal.
 
 Plain Python like the other suites, no pytest: the plugin router is mounted on a bare FastAPI app
-and driven with TestClient. The goals module is the real ``hermes_cli.goals`` (so the fixture is a
-real ``GoalState``, not a dict that only looks like one), with only ``load_goal`` replaced per case:
-the route is a local SQLite meta read, and a test must not depend on this machine's goal rows.
+and driven with TestClient. The route reads the persisted ``state_meta`` row through the published
+``hermes_state`` surface (``SessionDB(read_only=True)``), so the fixture is the real database shape:
+each case swaps ``_goal_db`` for a handle whose ``get_meta`` answers a map of goal JSON, and one
+case runs the real ``SessionDB`` against a temporary state.db. No case touches this machine's goal
+rows, and the real handle factory is restored before the module-unavailable case and at the end.
 
     python3 tests/test_goals.py
 
-No network, no real plugin data, and the real goals module is restored before the module-unavailable
-case and after every patch.
+No network and no real plugin data.
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ import _bootstrap  # noqa: E402,F401  finds the Hermes tree and a sandbox home
 
 import importlib.util
 import json
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 PLUGIN = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -57,11 +60,8 @@ def main() -> int:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    import hermes_cli.goals as real_goals
-    from hermes_cli.goals import GoalGate, GoalState
-
-    real_load_goal = real_goals.load_goal
     api = load("pcc_goals_api", PLUGIN / "dashboard" / "plugin_api.py")
+    real_goal_db = api._goal_db
     app = FastAPI()
     app.include_router(api.router)
     client = TestClient(app)
@@ -74,31 +74,39 @@ def main() -> int:
             return response.status_code, {"code": "not_json", "error": response.text[:200]}
 
     def serve(rows: dict[str, Any], *, raises: set[str] | None = None):
-        """Replace load_goal with a map lookup, and record every id it was asked for."""
+        """Replace the state.db handle with a map lookup, and record every id it was asked for."""
+
         asked: list[str] = []
 
-        def fake(session_id: str):
-            asked.append(session_id)
-            if raises and session_id in raises:
-                raise RuntimeError("state.db is locked for this test")
-            return rows.get(session_id)
+        class FakeGoalDB:
+            def get_meta(self, key: str) -> Optional[str]:
+                session_id = key[len("goal:"):] if key.startswith("goal:") else key
+                asked.append(session_id)
+                if raises and session_id in raises:
+                    raise RuntimeError("state.db is locked for this test")
+                value = rows.get(session_id)
+                return None if value is None else json.dumps(value)
 
-        real_goals.load_goal = fake
+            def close(self) -> None:
+                pass
+
+        setattr(api, "_goal_db", lambda: FakeGoalDB())
         return asked
 
     def goal(title: str, *, status: str = "active", turns: int = 3, budget: int = 12,
              subgoals: list[str] | None = None, gates: list[Any] | None = None,
-             last_turn_at: float = 1_700_000_000.0) -> Any:
-        return GoalState(goal=title, status=status, turns_used=turns, max_turns=budget,
-                         subgoals=list(subgoals or []), gates=list(gates or []),
-                         created_at=1_699_000_000.0, last_turn_at=last_turn_at)
+             last_turn_at: float = 1_700_000_000.0) -> dict[str, Any]:
+        """The JSON `hermes_cli.goals` persists: GoalState.to_json() without the wait machinery."""
+        return {"goal": title, "status": status, "turns_used": turns, "max_turns": budget,
+                "subgoals": list(subgoals or []), "gates": list(gates or []),
+                "contract": {}, "created_at": 1_699_000_000.0, "last_turn_at": last_turn_at}
 
     try:
         # --- the answer ---------------------------------------------------------
         section("route / an active goal is the whole row the card renders")
         read("")  # warm the client, no ids
         api._CACHE.clear()
-        gate = GoalGate(command="pytest -q", attempts=2, last_exit_code=0)
+        gate = {"command": "pytest -q", "attempts": 2, "last_exit_code": 0}
         active = goal("Fix the login redirect loop", turns=4, budget=20,
                       subgoals=["sign in as a fresh user", "land on /dashboard"],
                       gates=[gate], last_turn_at=1_700_000_500.0)
@@ -149,6 +157,35 @@ def main() -> int:
         check("no ids is ok:true and no goals, not an error",
               code == 200 and empty == {"ok": True, "goals": {}}, str(empty))
 
+        # --- rows that are not the shape we expect -------------------------------
+        section("route / a persisted row is type-checked, never trusted")
+        api._CACHE.clear()
+        serve({
+            "s-bad-json": "{not json",
+            "s-not-object": ["a", "list"],
+            "s-no-status": {"goal": "old row", "turns_used": 1, "max_turns": 5},
+            "s-bad-fields": {"goal": "  padded  ", "status": "active", "turns_used": "7",
+                             "max_turns": None, "subgoals": [" a ", "", 3, None],
+                             "gates": [{"command": ""}, {"command": "npm test",
+                                                        "last_exit_code": None}, "junk"]}
+        })
+        code, body = read("s-bad-json,s-not-object,s-no-status,s-bad-fields")
+        found = body.get("goals") or {}
+        print(f"  goals: {json.dumps(found, default=str)}")
+        check("unparseable JSON and a non-object row are no goal, not a failed view",
+              code == 200 and body.get("ok") is True and "s-bad-json" not in found
+              and "s-not-object" not in found, str(sorted(found)))
+        check("an old row with no status keeps reading as active, as GoalState.from_json defaulted it",
+              (found.get("s-no-status") or {}).get("max_turns") == 5, str(found.get("s-no-status")))
+        row = found.get("s-bad-fields") or {}
+        check("fields are coerced to the card's types",
+              row.get("title") == "padded" and row.get("turns_used") == 7
+              and row.get("max_turns") == 20 and row.get("subgoals") == ["a"],
+              str(row))
+        check("a gate without a command is dropped; a pending one keeps last_exit_code null",
+              row.get("gates") == [{"command": "npm test", "attempts": 0, "last_exit_code": None}],
+              str(row.get("gates")))
+
         # --- ids ---------------------------------------------------------------
         section("route / the id list is de-duplicated, capped and shape checked")
         api._CACHE.clear()
@@ -190,24 +227,51 @@ def main() -> int:
               code == 200 and body.get("ok") is False
               and body.get("code") == "goals_unavailable", str(body))
 
-        section("route / a missing or broken goals module answers goals_unavailable, not a 500")
+        section("route / an unreadable state database answers goals_unavailable, not a 500")
         api._CACHE.clear()
-        saved = sys.modules.get("hermes_cli.goals")
-        sys.modules["hermes_cli.goals"] = None  # type: ignore[assignment]  # `from ... import` raises
+        setattr(api, "_goal_db", real_goal_db)
+        saved = sys.modules.get("hermes_state")
+        sys.modules["hermes_state"] = None  # type: ignore[assignment]  # `from ... import` raises
         try:
             code, body = read("20261113_212605_66fa65")
         finally:
             if saved is None:
-                sys.modules.pop("hermes_cli.goals", None)
+                sys.modules.pop("hermes_state", None)
             else:
-                sys.modules["hermes_cli.goals"] = saved
+                sys.modules["hermes_state"] = saved
         print(f"  HTTP {code} {json.dumps(body, default=str)}")
-        check("a missing module is HTTP 200 with code goals_unavailable",
+        check("a missing state module is HTTP 200 with code goals_unavailable",
               code == 200 and body.get("ok") is False
               and body.get("code") == "goals_unavailable", f"HTTP {code} {body.get('code')}")
         check("the error is one sentence, not a traceback",
               isinstance(body.get("error"), str) and body["error"].strip().endswith("."),
               str(body.get("error")))
+
+        # --- the real read path --------------------------------------------------
+        section("route / the real persisted row, through the published hermes_state surface")
+        api._CACHE.clear()
+        from hermes_state import SessionDB
+
+        tmp = Path(tempfile.mkdtemp()) / "state.db"
+        conn = sqlite3.connect(tmp)
+        conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO state_meta VALUES (?, ?)",
+                     ("goal:real-1", json.dumps(goal("A real persisted goal", turns=6, budget=30))))
+        conn.execute("INSERT INTO state_meta VALUES (?, ?)",
+                     ("goal:real-done", json.dumps(goal("done", status="done"))))
+        conn.commit()
+        conn.close()
+        setattr(api, "_goal_db", lambda: SessionDB(tmp, read_only=True))
+        code, body = read("real-1,real-done,real-missing")
+        found = body.get("goals") or {}
+        print(f"  HTTP {code} {json.dumps(found, default=str)}")
+        check("a goal written to state_meta is read back as the card's row",
+              code == 200 and body.get("ok") is True
+              and (found.get("real-1") or {}).get("title") == "A real persisted goal"
+              and (found.get("real-1") or {}).get("turns_used") == 6
+              and (found.get("real-1") or {}).get("max_turns") == 30, str(found))
+        check("a done row and a session with no row stay absent",
+              "real-done" not in found and "real-missing" not in found, str(sorted(found)))
 
         section("route / the answer is cached 30 s under the sorted id list")
         api._CACHE.clear()
@@ -219,14 +283,14 @@ def main() -> int:
         check("the first read fills the cache and the second answers from it",
               first_code == second_code == 200 and second.get("cached") is True,
               f"cached={second.get('cached')}")
-        check("a reordered id list is the same key, so load_goal ran once per id",
+        check("a reordered id list is the same key, so the meta read ran once per id",
               len(asked) == 2 and sorted(second.get("goals") or {}) == ["s1", "s2"], str(asked))
         check("the cache drops the row shape down to the same keys",
               set((second.get("goals") or {}).get("s2") or {}) == set((first.get("goals") or {}).get("s2") or {}))
     finally:
-        # The patch swapped one module attribute in this process: put the real reader back so a
-        # later suite imported into the same interpreter never inherits the fake.
-        real_goals.load_goal = real_load_goal
+        # The patch swapped the handle factory in this process: put the real one back so a later
+        # suite imported into the same interpreter never inherits the fake.
+        setattr(api, "_goal_db", real_goal_db)
 
     if FAILURES:
         print(f"\nFAILED: {len(FAILURES)}")

@@ -35,7 +35,7 @@ vm.runInThisContext(
   `${block}
 ;globalThis.__PCC_REACTIONS__ = { GH_REACTION_CHIPS, GH_REACTION_ORDER, GH_DRAFT_QUOTE_MAX,
   ghReactionGlyph, ghReactionLabel, ghReactionModel, ghReactionPicker, ghReactionToggle,
-  ghCommentDraftText, ghLinkedSessions }`,
+  ghCommentDraftText, ghLinkedSessions, ghReactionTarget, ghReactionRequest }`,
   { filename: PLUGIN }
 )
 const S = globalThis.__PCC_REACTIONS__
@@ -164,4 +164,63 @@ test('linked sessions match the number on the right column', () => {
   assert.deepEqual(S.ghLinkedSessions(links, 'pr', 42).map(link => link.session_id), ['s2'])
   assert.deepEqual(S.ghLinkedSessions(links, 'issue', 0), [])
   assert.deepEqual(S.ghLinkedSessions(null, 'issue', 42), [])
+})
+
+// A comment is not the thread body: the route refuses `{kind:'issue',
+// comment_id}` with bad_kind, so the request body has to name the comment.
+test('a reaction on a comment targets the comment, whatever thread it sits on', () => {
+  const onPrComment = S.ghReactionRequest({
+    commentId: 900,
+    content: '+1',
+    folder: '/home/nyll/dev/alpha',
+    kind: 'pr',
+    number: 42
+  })
+
+  assert.deepEqual(onPrComment, {
+    kind: 'issue_comment',
+    content: '+1',
+    comment_id: 900,
+    path: '/home/nyll/dev/alpha'
+  })
+
+  const onIssueComment = S.ghReactionRequest({
+    commentId: '901',
+    content: 'heart',
+    folder: '/home/nyll/dev/alpha',
+    kind: 'issue',
+    number: 7
+  })
+
+  assert.deepEqual(onIssueComment, {
+    kind: 'issue_comment',
+    content: 'heart',
+    comment_id: 901,
+    path: '/home/nyll/dev/alpha'
+  })
+
+  // A review comment is already the right kind and must not become an issue one.
+  assert.equal(
+    S.ghReactionTarget('review_comment', 902),
+    'review_comment'
+  )
+  assert.equal(
+    S.ghReactionTarget('review_comment', 0),
+    'issue',
+    'no comment id means the thread body, never a review comment'
+  )
+})
+
+test('a reaction on the thread body names the PR or the issue itself', () => {
+  assert.deepEqual(
+    S.ghReactionRequest({ content: 'eyes', folder: '/r', kind: 'pr', number: 42 }),
+    { kind: 'pr', content: 'eyes', number: 42, path: '/r' }
+  )
+  assert.deepEqual(
+    S.ghReactionRequest({ content: 'eyes', folder: '/r', kind: 'issue', number: 7 }),
+    { kind: 'issue', content: 'eyes', number: 7, path: '/r' }
+  )
+  // An unknown kind with no comment id is an issue body, the safe default.
+  assert.equal(S.ghReactionTarget('', null), 'issue')
+  assert.equal(S.ghReactionTarget('pr', 0), 'pr')
 })

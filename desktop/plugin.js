@@ -61,7 +61,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'laneid-fix.2026-11-13T1715Z'
+const PLUGIN_BUILD = 'review-fixes.2026-11-13T1749Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -639,8 +639,12 @@ function kanbanFilterCards(cards, filters) {
   return (cards || []).filter(card => {
     if (!card) return false
     if (f.projectId && card.projectId !== f.projectId) return false
-    if (source === 'user' && card.source !== 'user') return false
-    if (source === 'agent' && card.source !== 'agent' && card.source !== 'auto') return false
+    // Cards carry the lane that won and the source behind it as `laneSource`;
+    // the bare `source` is the session's own source, which a lane move replaces.
+    const from = card.laneSource || card.source
+
+    if (source === 'user' && from !== 'user') return false
+    if (source === 'agent' && from !== 'agent' && from !== 'auto') return false
     if (f.staleOnly && !card.stale) return false
     if (!q) return true
     const hay = [
@@ -686,6 +690,52 @@ function sortKanbanCards(cards, lanes, direction) {
 // the project's lane instead of this session's card.
 function kanbanMoveBody(projectId, sessionId, status) {
   return { project_id: projectId, session_id: sessionId, status, scope: 'session' }
+}
+
+// session.list rows carry an id, a title and a start time: no cwd, no branch and
+// no last-active stamp. The tree is the only place those live, so build its two
+// indexes once per read rather than guessing per card: `sessionIds` names every
+// session a project claims, `previewSessions` carries the checkout and stamps.
+function sessionIndex(treeProjects) {
+  const bySession = new Map()
+  const previewById = new Map()
+
+  for (const project of treeProjects || []) {
+    if (!project || !project.id) continue
+
+    for (const id of project.sessionIds || []) {
+      const key = String(id || '')
+
+      if (key && !bySession.has(key)) bySession.set(key, String(project.id))
+    }
+
+    for (const preview of project.previewSessions || []) {
+      const key = String((preview && preview.id) || '')
+
+      if (key && !previewById.has(key)) previewById.set(key, preview)
+    }
+  }
+
+  return { bySession, previewById }
+}
+
+// A link row names the project; an unlinked session is placed by the tree's own
+// `sessionIds` claim. Anything else would be a path guess the payload cannot
+// support.
+function sessionProjectId(sessionId, link, index) {
+  const named = String((link && link.project_id) || '').trim()
+
+  if (named) return named
+
+  const claimed = index && index.bySession ? index.bySession.get(String(sessionId || '')) : ''
+
+  return String(claimed || '')
+}
+
+// The branch a card can honestly show: the session's own preview checkout, then
+// the folder's checked-out branch. Empty means the card draws no chip.
+function sessionBranch(preview, projectBranch) {
+  return String((preview && preview.git_branch) || '').trim() || String(projectBranch || '').trim()
 }
 // session-kanban:end
 
@@ -1759,6 +1809,31 @@ function projectForPath(folders, path) {
   }
 
   return ''
+}
+
+// Every folder a project owns, longest first, which is the order projectForPath
+// needs for the nearest project to win. One builder for the board and the
+// titlebar tool, so both match paths by the same rule.
+function projectFoldersOf(projects) {
+  const out = []
+
+  for (const project of projects || []) {
+    if (!project || !project.id) continue
+
+    const paths = [
+      primaryPath(project),
+      ...(Array.isArray(project.paths) ? project.paths : []),
+      ...(Array.isArray(project.repos) ? project.repos.map(repo => repo && repo.path) : [])
+    ]
+
+    for (const path of paths) {
+      const folder = String(path || '').replace(/\/+$/, '')
+
+      if (folder) out.push({ id: String(project.id), path: folder })
+    }
+  }
+
+  return out.sort((a, b) => b.path.length - a.path.length)
 }
 
 function validColor(color) {
@@ -5164,6 +5239,31 @@ function ghLinkedSessions(links, kind, number) {
     return value === n
   })
 }
+
+// The route's `kind` names the object a reaction lands on. A comment id is never
+// the thread body: it is an issue comment, or a review comment when the caller
+// already knows it is one. No comment id means the body itself.
+function ghReactionTarget(kind, commentId) {
+  const id = Number(commentId)
+  const name = String(kind || '')
+
+  if (Number.isFinite(id) && id > 0) return name === 'review_comment' ? 'review_comment' : 'issue_comment'
+
+  return name === 'pr' ? 'pr' : 'issue'
+}
+
+// The whole POST body for one reaction, built here so the kind mapping is the
+// single rule a click and a test both read.
+function ghReactionRequest({ commentId, content, folder, kind, number }) {
+  const id = Number(commentId)
+
+  return {
+    kind: ghReactionTarget(kind, id),
+    content,
+    ...(Number.isFinite(id) && id > 0 ? { comment_id: id } : { number: Number(number) }),
+    path: folder
+  }
+}
 // github-reactions:end
 
 function GhReactionChip({ busy, onToggle, row }) {
@@ -5206,18 +5306,12 @@ function GhReactions({ commentId, folder, kind, number, reactions }) {
     if (busy || !pluginCtx) return
 
     const before = rows
-    const target = kind === 'pr' ? 'pr' : kind === 'review_comment' ? 'review_comment' : kind === 'issue_comment' ? 'issue_comment' : 'issue'
 
     setRows(ghReactionToggle(before, content))
     setBusy(true)
     ghRest('/github/reaction', {
       method: 'POST',
-      body: {
-        kind: target,
-        content,
-        ...(commentId ? { comment_id: Number(commentId) } : { number: Number(number) }),
-        path: folder
-      }
+      body: ghReactionRequest({ commentId, content, folder, kind, number })
     })
       .then(res => {
         if (res && res.ok === true && Array.isArray(res.reactions)) {
@@ -8433,6 +8527,9 @@ function ProjectDetailPage() {
   const [panelMode, setPanelMode] = useState('branch')
   const [panelDrag, setPanelDrag] = useState(null)
   const [panelDropLane, setPanelDropLane] = useState('')
+  // The same fold map the Status board uses: a lane folded there is folded here,
+  // and a click on either page's rail is remembered for both.
+  const collapsedLanes = useValue($collapsed)
 
   const tree = useQuery({
     queryFn: () => host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT, ...profileParam() }),
@@ -8504,6 +8601,7 @@ function ProjectDetailPage() {
             link,
             project,
             projectId: project ? project.id : projectId,
+            folder: folderPath,
             pr,
             issue,
             projectLane,
@@ -8516,7 +8614,7 @@ function ProjectDetailPage() {
     }
 
     return kanbanPlaceCards(out, laneRows)
-  }, [lanes, linkBySession, projectRefs, project, projectId, projectLane, laneRows])
+  }, [lanes, linkBySession, projectRefs, project, projectId, projectLane, folderPath, laneRows])
   const panelCounts = useMemo(() => kanbanCounts(panelCards, laneRows), [panelCards, laneRows])
   const panelByLane = useMemo(() => {
     const map = new Map(laneRows.map(lane => [lane.id, []]))
@@ -8535,12 +8633,31 @@ function ProjectDetailPage() {
     if (!card || !status || card.lane === status) return
     writeSessionLane(card.projectId, card.sessionId, status)
   }
+  // A rail click folds or unfolds one lane, exactly as the Status board's does.
+  const panelToggleLane = laneId => {
+    if (!laneId) return
+    const next = { ...collapsedLanes }
+    const hasCards = (panelByLane.get(laneId) || []).length > 0
+
+    next[laneId] = !laneCollapsed(laneId, collapsedLanes, hasCards)
+    $collapsed.set(next)
+    writeCollapsed(next)
+  }
   const panelDrop = laneId => {
     const card = panelDrag
 
     setPanelDrag(null)
     setPanelDropLane('')
-    if (card && laneId) panelMove(card, laneId)
+    if (!card || !laneId) return
+    // Same rule as the Status board: a card dropped on a folded rail unfolds the
+    // lane first, so the move never disappears into a strip.
+    if (laneCollapsed(laneId, collapsedLanes, true)) {
+      const next = { ...collapsedLanes, [laneId]: false }
+
+      $collapsed.set(next)
+      writeCollapsed(next)
+    }
+    panelMove(card, laneId)
   }
 
   // The header names the work tree a vault subfolder really belongs to. Same
@@ -8763,6 +8880,7 @@ function ProjectDetailPage() {
                     style: S.panelBoard,
                     children: jsx(KanbanViews, {
                       byLane: panelByLane,
+                      collapsed: collapsedLanes,
                       counts: panelCounts,
                       direction: 1,
                       dragCard: panelDrag,
@@ -8779,6 +8897,7 @@ function ProjectDetailPage() {
                       onOpenProject: openProject,
                       onOpenSession: openSession,
                       onSortLane: () => {},
+                      onToggleCollapse: panelToggleLane,
                       states: live.byStored,
                       view: 'kanban'
                     })
@@ -9174,7 +9293,10 @@ function buildKanbanCard(input) {
   const lane = kanbanLaneFor(link, source.pr || null, source.projectLane, source.lanes, source.issue || null)
   const started = stampMs(session.started_at)
   const updated = stampMs(link && link.status_updated_at)
-  const lastActivity = Math.max(started, updated)
+  // The row's own start time is the floor. A caller that read the tree's preview
+  // row (the only place last-active lives) hands the newest stamp in, and the
+  // link row's last move can be newer still.
+  const lastActivity = Math.max(started, updated, Number(source.lastActivity) || 0)
   const now = Number(source.now) || Date.now()
   const title =
     String(session.title || '').trim() ||
@@ -9189,7 +9311,7 @@ function buildKanbanCard(input) {
     projectId,
     projectLabel: projectId ? String((project && project.label) || projectId) : 'No project',
     folder: String(source.folder || '').trim(),
-    branch: String(source.branch || '').trim() || 'main',
+    branch: String(source.branch || '').trim(),
     issue: Number.isFinite(rawIssue) && rawIssue > 0 ? rawIssue : 0,
     pr: Number.isFinite(rawPr) && rawPr > 0 ? rawPr : 0,
     prState: source.pr || null,
@@ -9606,24 +9728,12 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
   })
 }
 
-// The project this card belongs to, with its own mark: the same door the board
-// uses (a local image, a stack glyph, then the initial), and a click that goes to
-// the project page rather than the session. A card with no project says so.
+// The project this card belongs to, with its own mark: the board's own Avatar
+// (a local image, a stack glyph, then the initial) so the fallback chain lives
+// in one component, and a click that goes to the project page rather than the
+// session. A card with no project says so.
 function KanbanProjectTag({ card, onOpenProject }) {
-  const icon = useProjectIcon(card.folder)
-  const mark =
-    icon && icon.kind === 'image' && icon.data_url
-      ? jsx('img', {
-          alt: '',
-          decoding: 'async',
-          src: icon.data_url,
-          style: { borderRadius: 3, flex: 'none', height: 14, objectFit: 'contain', width: 14 }
-        })
-      : jsx(Codicon, {
-          name: (icon && icon.kind === 'glyph' && STACK_GLYPH[String(icon.stack || '')]) || 'project',
-          size: '0.75rem',
-          style: { color: 'var(--ui-text-quaternary)', flex: 'none' }
-        })
+  const mark = jsx(Avatar, { project: { label: card.projectLabel, path: card.folder }, size: 14 })
   const box = { alignItems: 'center', display: 'inline-flex', gap: 5, maxWidth: '100%', minWidth: 0 }
 
   if (!card.projectId) {
@@ -9698,7 +9808,7 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
         style: S.kcardMeta,
         children: [
           jsx(KanbanProjectTag, { card, onOpenProject }, 'project'),
-          jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }, 'branch'),
+          card.branch ? jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }, 'branch') : null,
           jsx(KanbanRefChip, { card }, 'refs'),
           card.linked
             ? null
@@ -9946,7 +10056,7 @@ function KanbanTable({ cards, direction, lanes, onMove, onOpenProject, onOpenSes
                       value: card.lane
                     })
                   }),
-                  jsx('td', { children: jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }) }),
+                  jsx('td', { children: card.branch ? jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }) : null }),
                   jsx('td', { children: jsx(KanbanRefChip, { card }) }),
                   jsx('td', {
                     style: { color: 'var(--ui-text-quaternary)', whiteSpace: 'nowrap' },
@@ -10061,30 +10171,11 @@ function useSessionCards(lanes) {
     return out
   }, [treeProjects, boardProjects])
   const projectById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
-  // Every folder a project owns, longest first: a linked session names its
-  // project directly, an unlinked one is placed by where it ran, exactly as the
-  // store's own `cwd_prefix` resolution does it.
-  const projectFolders = useMemo(() => {
-    const out = []
-
-    for (const project of projects) {
-      if (!project || !project.id) continue
-
-      const paths = [
-        primaryPath(project),
-        ...(Array.isArray(project.paths) ? project.paths : []),
-        ...(Array.isArray(project.repos) ? project.repos.map(repo => repo && repo.path) : [])
-      ]
-
-      for (const path of paths) {
-        const folder = String(path || '').replace(/\/+$/, '')
-
-        if (folder) out.push({ id: String(project.id), path: folder })
-      }
-    }
-
-    return out.sort((a, b) => b.path.length - a.path.length)
-  }, [projects])
+  // The tree's own join, built once: `sessionIds` maps a session to the project
+  // that claims it and `previewSessions` carries the checkout and stamps a
+  // session.list row does not have. The Home bucket (`isNoProject`) claims every
+  // unowned session, which is the opposite of a project, so it never answers.
+  const join = useMemo(() => sessionIndex(treeProjects.filter(project => project && project.isNoProject !== true)), [treeProjects])
   const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
   const refsByProject = useProjectRefs(projects, boardState.links)
   const branches = useProjectBranches(projects)
@@ -10097,14 +10188,12 @@ function useSessionCards(lanes) {
 
     return rows.map(session => {
       const link = linkBySession.get(session.id) || null
-      const named = String((link && link.project_id) || '')
-      // No link row is not "no project": a session that ran inside a project's
-      // folder belongs to it, and naming that project here is what makes the
-      // card's lane writable (the store creates the missing link row on the POST).
-      const project = named
-        ? projectById.get(named) || null
-        : projectById.get(projectForPath(projectFolders, session.git_repo_root || session.cwd)) || null
-      const projectId = String(named || (project && project.id) || '')
+      // The link row names the project; without one, the tree's `sessionIds`
+      // claim does. Naming that project here is what makes the card's lane
+      // writable (the store creates the missing link row on the POST).
+      const projectId = sessionProjectId(session.id, link, join)
+      const project = projectId ? projectById.get(projectId) || null : null
+      const preview = join.previewById.get(String(session.id)) || null
       const folder = project ? primaryPath(project) : ''
       const refs = projectId ? refsByProject.get(projectId) : null
       const number = Number(link && link.pr)
@@ -10115,12 +10204,15 @@ function useSessionCards(lanes) {
         session,
         link,
         project,
+        folder,
         pr,
         issue,
         projectLane: projectId ? statuses[projectId] : '',
-        // A session that knows its own checkout branch groups by that; the
-        // folder's checked-out branch is the fallback the card already shows.
-        branch: String(session.git_branch || '').trim() || (folder ? branches[folder] : ''),
+        // The preview row knows the session's checkout; the folder's current
+        // branch is the fallback. Neither means no chip rather than a fake main.
+        branch: sessionBranch(preview, folder ? branches[folder] : ''),
+        // The preview row is the only payload with a last-active stamp.
+        lastActivity: sessionStamp(preview || session),
         now,
         lanes
       })
@@ -10128,7 +10220,7 @@ function useSessionCards(lanes) {
 
       return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
     })
-  }, [sessionsQuery.data, linkBySession, projectById, projectFolders, refsByProject, statuses, branches, overrides, lanes])
+  }, [sessionsQuery.data, linkBySession, projectById, join, refsByProject, statuses, branches, overrides, lanes])
 
   return { boardState, cards, live, projectById, projects, sessionsQuery, tree }
 }
@@ -10435,13 +10527,90 @@ function ProjectCommandCenterPage() {
 // it yet, so the area name is written out.
 const TITLEBAR_TOOL_AREA = 'titleBar.tools.right'
 
+// The stored id of the session the app has focused. `host.state` atoms are
+// readonly signals, so this is a read, never a subscription: the click is when
+// the answer matters.
+function focusedSessionId() {
+  try {
+    const atom = host.state ? host.state.focusedStoredSessionId : null
+    const value = atom && typeof atom.get === 'function' ? atom.get() : ''
+
+    return String(value || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function focusedCwd() {
+  try {
+    const atom = host.state ? host.state.cwd : null
+    const value = atom && typeof atom.get === 'function' ? atom.get() : ''
+
+    return String(value || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function linkProjectForSession(links, sessionId) {
+  for (const link of Array.isArray(links) ? links : []) {
+    if (link && link.session_id === sessionId && link.project_id) return String(link.project_id)
+  }
+
+  return ''
+}
+
+// The focused session's project, in the only order the payloads support: the
+// board's link row, the tree's `sessionIds` claim, then the project folder that
+// contains the app's cwd. The session row itself has no path to match.
+function focusedProjectId(sessionId) {
+  if (!sessionId) return Promise.resolve('')
+
+  return Promise.all([
+    boardRest('/board').catch(() => null),
+    host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT, ...profileParam() }).catch(() => null)
+  ]).then(([board, tree]) => {
+    const linked = linkProjectForSession(board && board.links, sessionId)
+
+    if (linked) return linked
+
+    // The Home bucket claims every unowned session; it is not a project.
+    const projects = (tree && Array.isArray(tree.projects) ? tree.projects : []).filter(
+      project => project && project.isNoProject !== true
+    )
+    const claimed = projects.find(project => (project.sessionIds || []).includes(sessionId))
+
+    if (claimed && claimed.id) return String(claimed.id)
+
+    return projectForPath(projectFoldersOf(projects), focusedCwd())
+  })
+}
+
+// The titlebar click. It opens the focused session's project page, or says why
+// there is none and shows the board: the session tab leaves the route already
+// here, so a `to` on the tool would be a no-op.
+function openFocusedSessionProject() {
+  return focusedProjectId(focusedSessionId())
+    .catch(() => '')
+    .then(projectId => {
+      if (projectId) {
+        openProject(projectId)
+
+        return
+      }
+
+      openView('projects')
+      host.notify({ kind: 'info', message: 'This session is not in a project yet, so the board opened instead.' })
+    })
+}
+
 function titlebarTool() {
   return {
     id: 'pcc-open',
-    label: 'Projects',
-    title: 'Projects',
+    label: "Open this session's project",
+    title: "Open this session's project",
     icon: jsx(Codicon, { name: 'inbox', size: '13.9px' }),
-    to: ROUTE
+    onSelect: openFocusedSessionProject
   }
 }
 

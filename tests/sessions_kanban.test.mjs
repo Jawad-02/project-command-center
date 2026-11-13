@@ -60,6 +60,9 @@ vm.runInThisContext(
     kanbanCounts,
     sortKanbanCards,
     kanbanMoveBody,
+    sessionIndex,
+    sessionProjectId,
+    sessionBranch,
     laneIdIn,
     normalizeLaneTable,
     normalizeLaneFilter,
@@ -72,6 +75,29 @@ vm.runInThisContext(
   { filename: PLUGIN }
 )
 const K = globalThis.__PCC_KANBAN__
+
+// The card builder is not in the sliced block (it is a renderer helper), but a
+// filter test that hand-writes card objects proves nothing: it would have missed
+// a field the builder never emits. Extract the builder and the stamp readers it
+// calls, so every card in this suite is the object the page really renders.
+function fn(name) {
+  const start = source.indexOf(`function ${name}(`)
+
+  assert.ok(start >= 0, `${name} missing from desktop/plugin.js`)
+
+  const end = source.indexOf('\n}\n', start)
+
+  assert.ok(end > start, `${name} has no closing brace`)
+
+  return source.slice(start, end + 3)
+}
+
+vm.runInThisContext(
+  `${fn('toMs')}\n${fn('stampMs')}\n${fn('sessionStamp')}\n${fn('buildKanbanCard')}
+;globalThis.__PCC_CARD__ = { buildKanbanCard, sessionStamp, stampMs }`,
+  { filename: PLUGIN }
+)
+const C = globalThis.__PCC_CARD__
 
 const DEFAULT_IDS = ['unfiled', 'backlog', 'active', 'review', 'blocked', 'done', 'canceled']
 const ids = lanes => lanes.map(lane => lane.id)
@@ -156,42 +182,195 @@ test('the provenance words are the four the card promises', () => {
 })
 
 test('a filter narrows by project, source, staleness and search, and they compose', () => {
-  const rows = [
-    card({ title: 'Auth token refresh', projectId: 'p1', projectLabel: 'Alpha', source: 'user', lane: 'active', branch: 'feat/auth', issue: 12 }),
-    card({ title: 'Billing retries', projectId: 'p2', projectLabel: 'Beta', source: 'agent', lane: 'review', stale: true, branch: 'main', pr: 34 }),
-    card({ title: 'Docs sweep', projectId: 'p1', projectLabel: 'Alpha', source: 'pr', lane: 'done', branch: 'docs', pr: 0 })
+  // Real gateway shapes: a session.list row has no cwd, branch or last-active,
+  // a link row names the lane that won, and only the lane's source can answer
+  // the source filter.
+  const now = 1_700_000_000_000
+  const lanes = K.normalizeKanbanLanes([])
+  const alpha = { id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha' }
+  const beta = { id: 'p2', label: 'Beta', path: '/home/nyll/dev/beta' }
+  const sessions = [
+    { id: 's-auth', title: 'Auth token refresh', preview: '', started_at: 1_699_000_000, message_count: 6, source: 'gui', _lineage_root_id: null },
+    { id: 's-bill', title: 'Billing retries', preview: '', started_at: 1_698_000_000, message_count: 3, source: 'agent', _lineage_root_id: null },
+    { id: 's-docs', title: 'Docs sweep', preview: '', started_at: 1_697_000_000, message_count: 2, source: 'gui', _lineage_root_id: null }
   ]
+  const links = [
+    { session_id: 's-auth', project_id: 'p1', status: 'active', status_source: 'user', note: '', title: '', issue: 12, pr: 0, status_updated_at: 1_699_500_000 },
+    { session_id: 's-bill', project_id: 'p2', status: 'review', status_source: 'agent', note: '', title: '', issue: 0, pr: 34, status_updated_at: 1_699_400_000 },
+    { session_id: 's-docs', project_id: 'p1', status: 'done', status_source: 'auto', note: '', title: '', issue: 0, pr: 0, status_updated_at: 1_699_300_000 }
+  ]
+  const projectOf = id => (id === 'p2' ? beta : alpha)
+  const rows = sessions.map(session => {
+    const link = links.find(row => row.session_id === session.id) || null
+    const project = projectOf(session.id === 's-bill' ? 'p2' : 'p1')
+
+    return C.buildKanbanCard({
+      session,
+      link,
+      project,
+      projectId: project.id,
+      folder: project.path,
+      branch: session.id === 's-auth' ? 'feat/auth' : session.id === 's-docs' ? 'docs' : '',
+      now,
+      lanes
+    })
+  })
+
+  // The builder emits the winning source as `laneSource`; there is no `source`
+  // field on a card, which is what made the old filter blank the board.
+  assert.deepEqual(rows.map(row => row.laneSource), ['user', 'agent', 'auto'])
+  assert.ok(rows.every(row => row.source === undefined))
 
   assert.equal(K.kanbanFilterCards(rows, {}).length, 3)
   assert.equal(K.kanbanFilterCards(rows, { projectId: 'p1' }).length, 2)
-  assert.equal(K.kanbanFilterCards(rows, { source: 'user' }).length, 1)
-  assert.equal(K.kanbanFilterCards(rows, { source: 'agent' }).length, 1)
-  assert.equal(K.kanbanFilterCards(rows, { staleOnly: true }).length, 1)
-  assert.equal(K.kanbanFilterCards(rows, { staleOnly: true })[0].title, 'Billing retries')
+  assert.deepEqual(K.kanbanFilterCards(rows, { source: 'user' }).map(row => row.id), ['s-auth'])
+  // The agent filter is the store's own rule: an auto lane is agent work too.
+  assert.deepEqual(K.kanbanFilterCards(rows, { source: 'agent' }).map(row => row.id), ['s-bill', 's-docs'])
+  assert.deepEqual(K.kanbanFilterCards(rows, { source: 'agent' }).map(row => row.laneSource), ['agent', 'auto'])
 
   // Search: case-insensitive substring over title, project, branch and numbers.
   assert.equal(K.kanbanFilterCards(rows, { search: 'AUTH' }).length, 1)
   assert.equal(K.kanbanFilterCards(rows, { search: 'beta' }).length, 1)
-  assert.equal(K.kanbanFilterCards(rows, { search: 'main' }).length, 1)
+  assert.equal(K.kanbanFilterCards(rows, { search: 'feat/auth' }).length, 1)
   assert.equal(K.kanbanFilterCards(rows, { search: '34' }).length, 1)
   assert.equal(K.kanbanFilterCards(rows, { search: '#12' }).length, 1)
   assert.equal(K.kanbanFilterCards(rows, { search: 'nothing' }).length, 0)
 
   // Two filters that cannot both hold empty the list rather than OR together.
-  assert.equal(K.kanbanFilterCards(rows, { projectId: 'p1', source: 'agent' }).length, 0)
+  assert.equal(K.kanbanFilterCards(rows, { projectId: 'p2', source: 'user' }).length, 0)
+  assert.equal(K.kanbanFilterCards(rows, { projectId: 'p2', source: 'agent' }).length, 1)
   assert.equal(K.kanbanFilterCards(rows, { projectId: 'p1', source: 'user', search: '12' }).length, 1)
-  assert.equal(K.kanbanFilterCards(rows, { projectId: 'p1', staleOnly: true }).length, 0)
+})
+
+test('a session with no link row is placed by the tree sessionIds claim, with its preview branch and stamp', () => {
+  // The gateway truth: a session.list row is id/title/preview/started_at/
+  // message_count/source/_lineage_root_id. No cwd, no branch, no last_active.
+  // projects.tree is what carries sessionIds and the preview rows.
+  const now = 1_700_100_000_000
+  const lanes = K.normalizeKanbanLanes([])
+  const treeProjects = [
+    {
+      id: 'p1',
+      label: 'Alpha',
+      path: '/home/nyll/dev/alpha',
+      sessionIds: ['s1', 's2'],
+      previewSessions: [
+        { id: 's1', title: 'Kanban work', git_branch: 'feat/session-kanban', started_at: 1_700_000_000, ended_at: 1_700_050_000, last_active: 1_700_060_000 },
+        { id: 's2', title: 'No checkout', started_at: 1_700_000_000 }
+      ]
+    },
+    {
+      id: '__no_project__',
+      label: 'Home',
+      isNoProject: true,
+      sessionIds: ['s9'],
+      previewSessions: [{ id: 's9', started_at: 1_700_000_000 }]
+    }
+  ]
+  // What useSessionCards indexes: the Home bucket claims every unowned session
+  // and is not a project, so it is filtered before the index is built.
+  const projects = treeProjects.filter(project => project.isNoProject !== true)
+  const join = K.sessionIndex(projects)
+  const project = projects[0]
+  const session = { id: 's1', title: 'Kanban work', preview: '', started_at: 1_699_000_000, message_count: 12, source: 'gui', _lineage_root_id: null }
+  const projectId = K.sessionProjectId(session.id, null, join)
+  const preview = join.previewById.get(session.id)
+  const built = C.buildKanbanCard({
+    session,
+    link: null,
+    project,
+    projectId,
+    folder: project.path,
+    branch: K.sessionBranch(preview, 'trunk'),
+    lastActivity: C.sessionStamp(preview || session),
+    now,
+    lanes
+  })
+
+  assert.equal(projectId, 'p1')
+  assert.equal(built.projectId, 'p1')
+  assert.equal(built.projectLabel, 'Alpha')
+  assert.equal(built.folder, '/home/nyll/dev/alpha')
+  assert.equal(built.linked, false)
+  assert.equal(built.branch, 'feat/session-kanban')
+  // Last activity is the preview's newest stamp, not the list row's start time.
+  assert.equal(built.lastActivity, 1_700_060_000_000)
+  assert.ok(built.lastActivity > C.stampMs(session.started_at))
+
+  // The link row still wins, and a session nothing claims stays unplaced.
+  assert.equal(K.sessionProjectId('s1', { project_id: 'p2' }, join), 'p2')
+  assert.equal(K.sessionProjectId('s9', null, join), '')
+
+  // Branch: the preview's own checkout, then the project folder's branch, then
+  // nothing (the renderer draws no chip rather than a fake 'main').
+  assert.equal(K.sessionBranch(join.previewById.get('s2'), 'trunk'), 'trunk')
+  assert.equal(K.sessionBranch(join.previewById.get('s2'), ''), '')
+  assert.equal(K.sessionBranch(null, ''), '')
+  assert.equal(built.lastActivity !== C.stampMs(session.started_at), true)
+})
+
+test('a card carries the folder its project mark reads, and the mark has one chain', () => {
+  const lanes = K.normalizeKanbanLanes([])
+  const project = { id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha' }
+  const session = { id: 's1', title: 'Work', preview: '', started_at: 1_700_000_000, message_count: 1, source: 'gui', _lineage_root_id: null }
+
+  const withFolder = C.buildKanbanCard({ session, project, projectId: 'p1', folder: project.path, now: 1_700_000_100_000, lanes })
+  const without = C.buildKanbanCard({ session, now: 1_700_000_100_000, lanes })
+
+  assert.equal(withFolder.folder, '/home/nyll/dev/alpha')
+  assert.equal(without.folder, '')
+  assert.equal(withFolder.source, undefined, 'a card emits laneSource, never source')
+
+  // Both call sites must hand the folder over: the builder only forwards it.
+  const calls = source.split('buildKanbanCard({').slice(1)
+
+  assert.equal(calls.length, 2)
+  for (const call of calls) {
+    const head = call.slice(0, call.indexOf('})'))
+    const folderLine = head.split('\n').find(line => line.trim().startsWith('folder'))
+
+    assert.ok(folderLine, 'every buildKanbanCard call site passes folder')
+  }
+
+  // One icon fallback chain in the file: the tag delegates to Avatar, which is
+  // the component that calls useProjectIcon(primaryPath(project)).
+  const tag = fn('KanbanProjectTag')
+
+  assert.match(tag, /jsx\(Avatar, \{ project: \{ label: card\.projectLabel, path: card\.folder \}, size: 14 \}\)/)
+  assert.doesNotMatch(tag, /useProjectIcon|STACK_GLYPH/)
+  assert.match(fn('Avatar'), /useProjectIcon\(primaryPath\(project\)\)/)
 })
 
 test('a stale card is old and not done; an undated card is never stale', () => {
   const now = 10 * K.KANBAN_STALE_MS
+  const lanes = K.normalizeKanbanLanes([])
+  const project = { id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha' }
+  const oldSeconds = (now - K.KANBAN_STALE_MS - 1) / 1000
 
-  const oldActive = card({ lane: 'active', lastActivity: now - K.KANBAN_STALE_MS - 1, stale: true })
-  const oldDone = card({ lane: 'done', lastActivity: now - K.KANBAN_STALE_MS - 1, stale: false })
-  const fresh = card({ lane: 'active', lastActivity: now - 1000, stale: false })
+  // Built, not hand-written: `stale` is the builder's derivation from the lane
+  // and the newest stamp, so a fixture that sets it would prove nothing.
+  const build = (id, status, startedAt) =>
+    C.buildKanbanCard({
+      session: { id, title: id, preview: '', started_at: startedAt, message_count: 1, source: 'gui', _lineage_root_id: null },
+      link: { session_id: id, project_id: 'p1', status, status_source: 'user', note: '', title: '', issue: 0, pr: 0, status_updated_at: startedAt },
+      project,
+      projectId: 'p1',
+      folder: project.path,
+      now,
+      lanes
+    })
 
-  assert.equal(K.kanbanFilterCards([oldActive, oldDone, fresh], { staleOnly: true }).length, 1)
-  assert.equal(K.kanbanFilterCards([oldActive, oldDone, fresh], { staleOnly: true })[0], oldActive)
+  const oldActive = build('s-old-active', 'active', oldSeconds)
+  const oldDone = build('s-old-done', 'done', oldSeconds)
+  const fresh = build('s-fresh', 'active', now / 1000 - 10)
+  const undated = C.buildKanbanCard({ session: { id: 's-undated', preview: '' }, now, lanes })
+
+  assert.equal(oldActive.stale, true)
+  assert.equal(oldDone.stale, false, 'done is never stale')
+  assert.equal(fresh.stale, false)
+  assert.equal(undated.stale, false, 'no stamp is not old')
+
+  assert.deepEqual(K.kanbanFilterCards([oldActive, oldDone, fresh], { staleOnly: true }), [oldActive])
 })
 
 test('column counts follow the filtered list, not the raw one', () => {

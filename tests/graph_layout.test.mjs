@@ -28,6 +28,11 @@ const HERMES = join(homedir(), '.hermes', 'hermes-agent')
 // skips, and the project's own window still proves the engine.
 const HERMES_OK = existsSync(join(HERMES, '.git'))
 const HERMES_SKIP = HERMES_OK ? false : `hermes-agent repo missing at ${HERMES}`
+// `git archive <sha> | tar -x` carries no `.git`, so this checkout has no history
+// to read there either. Same policy as a missing hermes checkout: the tests that
+// need a repo skip, and the fixture/SVG tests still run.
+const REPO_OK = existsSync(join(REPO, '.git'))
+const REPO_SKIP = REPO_OK ? false : `no git history at ${REPO}`
 const BEGIN = '// graph-layout:begin'
 const END = '// graph-layout:end'
 const PALETTE = ['#4c8dff', '#e8912d', '#a879ff', '#2ec9d8', '#3fbf7f', '#d8b53a', '#e5686d', '#5aa9e6']
@@ -540,7 +545,7 @@ function readWindow(root, anchor, limit = WINDOW_LIMIT) {
 let realCache = null
 function realWindows() {
   if (realCache) return realCache
-  const windows = { pcc: readWindow(REPO) }
+  const windows = REPO_OK ? { pcc: readWindow(REPO) } : {}
   if (HERMES_OK) {
     // HEAD is a single-parent chain right now, so a HEAD-anchored window has no
     // branch lanes to prove. The newest window is anchored at the newest merge
@@ -578,7 +583,7 @@ function assertTrunkIsLaneZero(label, window, layout) {
   }
 }
 
-test('real window: project command center (linear, master trunk)', () => {
+test('real window: project command center (linear, master trunk)', { skip: REPO_SKIP }, () => {
   const { pcc } = realWindows()
   const layout = G.pccGraphLayout(pcc.input)
   checkLayout('pcc', pcc.input, layout, SVG_GEOM)
@@ -737,7 +742,7 @@ test('svg: every fixture and each available real window is written and inspectab
     written.push(writeSvg(`fixture-${name}`, fixture, layout))
   }
   const roots = realWindows()
-  written.push(writeSvg('real-pcc', roots.pcc, G.pccGraphLayout(roots.pcc.input)))
+  if (REPO_OK) written.push(writeSvg('real-pcc', roots.pcc, G.pccGraphLayout(roots.pcc.input)))
   if (HERMES_OK) {
     written.push(writeSvg('real-hermes-newest', roots.newest, G.pccGraphLayout(roots.newest.input)))
     written.push(writeSvg('real-hermes-octopus', roots.octopus, G.pccGraphLayout(roots.octopus.input)))

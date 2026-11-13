@@ -190,18 +190,34 @@ test('gate state is read from the exit code, never guessed', () => {
   assert.match(model.tip, /not run: make build/)
 })
 
-test('one read key: de-duplicated, capped at 60, caller order kept', () => {
-  const ids = ['a1', 'b2', 'a1', '', ' c3 ', null]
+test('one read key: de-duplicated, capped at 60, and order-insensitive', () => {
+  const ids = ['b2', 'a1', 'a1', '', ' c3 ', null]
   assert.equal(G.goalReadKey(ids), 'a1,b2,c3')
+  // The key is the SET of sessions. Typing in search or reordering the cards
+  // changes their order and must not change the key, or every goal line blinks
+  // off until the new read lands.
+  assert.equal(G.goalReadKey(['a1', 'b2', 'c3']), G.goalReadKey(['c3', 'b2', 'a1']))
+  assert.equal(G.goalReadKey(['s9', 's1']), G.goalReadKey(['s1', 's9']))
+
+  // The cap keeps the caller's newest-first head (the 60 the backend answers
+  // anyway), and the emitted list is sorted.
   const many = Array.from({ length: 90 }, (_, i) => `s${i}`)
-  const key = G.goalReadKey(many)
-  const parts = key.split(',')
+  const parts = G.goalReadKey(many).split(',')
 
   assert.equal(G.GOAL_IDS_LIMIT, 60)
   assert.equal(parts.length, 60)
-  assert.equal(parts[0], 's0', 'the newest first order the view passes is kept')
-  assert.equal(parts[59], 's59')
+  assert.deepEqual([...parts].sort(), parts, 'the key is sorted')
+  assert.deepEqual(parts, many.slice(0, 60).sort(), 'the cap keeps the newest 60 the view passed')
   assert.equal(G.goalReadKey([]), '')
+})
+
+// The keep-previous half lives in the hook, which needs a renderer and a query
+// cache: a behaviour test would be testing react-query, not this plugin. The
+// source slice pins the option name the hook passes.
+test('the goals read keeps the previous answer while a new key loads', () => {
+  const hook = fn('useSessionGoals')
+
+  assert.match(hook, /placeholderData: previous => previous/, 'a new id set must not blank the goal lines')
 })
 
 test('the card renders the line under the meta, and the line never opens the session', () => {
@@ -247,4 +263,28 @@ test('a failed read leaves cards bare and says why once, in the view header', ()
   assert.match(fn('DetailSessionRow'), /goal \? jsx\(GoalMeta, \{ goal \}/)
   assert.match(fn('SessionCard'), /goal \? jsx\(GoalMeta, \{ goal \}/)
   assert.match(fn('KanbanTable'), /card\.goal \? jsx\(GoalMeta, \{ goal: card\.goal \}\)/)
+})
+
+// Both row shapes must honour the marker the goal line carries. The kanban card
+// has always tested where the click started; the RowButton rows (the Projects
+// view card and the project page's session row) opened the session regardless, so
+// clicking the goal line there was a second door into the session.
+test('the goal line never opens its row, in either row shape', () => {
+  const rowClickOpens = new Function(`${fn('rowClickOpens')}\nreturn rowClickOpens`)()
+  const fake = matches => ({ target: { closest: selector => (matches.includes(selector) ? {} : null) } })
+
+  assert.equal(rowClickOpens(fake(['[data-pcc-noclick]'])), false, 'a click on the goal line does not open')
+  assert.equal(rowClickOpens(fake([])), true, 'a click anywhere else in the row does')
+  assert.equal(rowClickOpens({}), true, 'a keyboard activation has no target to inspect')
+  assert.equal(rowClickOpens(null), true)
+
+  // The wiring, as a slice: a row open handler needs a React root, so the one
+  // expression that consumes the predicate is what is pinned.
+  for (const name of ['SessionCard', 'DetailSessionRow']) {
+    assert.match(
+      fn(name),
+      /onClick: event => \{\s*if \(rowClickOpens\(event\)\) onOpen\(session\.id\)\s*\}/,
+      `${name} refuses a click that started on the goal line`
+    )
+  }
 })

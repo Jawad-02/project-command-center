@@ -61,7 +61,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'goal-visibility.2026-11-13T1900Z'
+const PLUGIN_BUILD = 'review-round-three.2026-11-13T2130Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -288,11 +288,20 @@ function sessionLaneTally(sessionCount, links, refs, projectLane, lanes) {
 
 // One short line: the total, then at most two lane counts in signal order. The
 // project's own lane is left out, so the line names the sessions that differ
-// from the column rather than repeating its default.
-function sessionLaneSummary(sessionCount, counts, projectLane) {
+// from the column rather than repeating its default. `lanes` is the live table:
+// without it a custom project lane is not recognized as a lane at all, so it is
+// repeated in the line and printed as its raw id instead of its label.
+function sessionLaneSummary(sessionCount, counts, projectLane, lanes) {
+  const table = (Array.isArray(lanes) ? lanes : [])
+    .map(row => ({
+      id: String((row && row.id) || row || '').trim().toLowerCase(),
+      label: String((row && row.label) || '').trim()
+    }))
+    .filter(row => row.id)
+  const allowed = table.map(row => row.id)
   const total = Number(sessionCount) || 0
   const parts = total > 0 ? [`${total} ${total === 1 ? 'session' : 'sessions'}`] : []
-  const own = sessionLaneId(projectLane)
+  const own = sessionLaneId(projectLane, allowed)
   // Signal order first, then any lane the server table added beyond it, so a
   // custom lane's count is never silently dropped from the line.
   const order = [
@@ -304,10 +313,22 @@ function sessionLaneSummary(sessionCount, counts, projectLane) {
     if (lane === own) continue
     if (parts.length >= 3) break
     const n = counts && Number(counts[lane])
-    if (Number.isFinite(n) && n > 0) parts.push(`${n} ${lane}`)
+    if (Number.isFinite(n) && n > 0) parts.push(`${n} ${sessionLaneWord(lane, table)}`)
   }
 
   return parts.join(' \u00b7 ')
+}
+
+// How a lane reads inside the summary line: the house word for a system lane
+// ("1 review"), and the label its author typed for a custom one, because there is
+// no house word for it and a raw id is not a word at all.
+function sessionLaneWord(lane, table) {
+  const row = (table || []).find(entry => entry.id === lane)
+  const label = row ? row.label : ''
+
+  if (!label) return String(lane)
+
+  return SESSION_LANE_LABELS[lane] ? String(lane) : label.toLowerCase()
 }
 // session-lane:end
 
@@ -756,6 +777,21 @@ function movedLane(overrides, id, resolved) {
 
   return move && move.status ? { lane: move.status, note: '', source: 'user' } : resolved
 }
+
+// The Status view's one count label. `session.list` is capped at
+// SESSION_LIST_LIMIT, so a list that reaches the cap says "newest 200 sessions"
+// rather than claiming that 200 is the whole history; a filter that hides rows
+// says how many it shows.
+function sessionCountLabel(total, shown) {
+  const all = Math.max(0, Number(total) || 0)
+  const seen = Math.max(0, Math.min(Number(shown) || 0, all))
+
+  if (all === 0) return ''
+  if (seen !== all) return `${seen} of ${all} sessions`
+  if (all >= SESSION_LIST_LIMIT) return `newest ${all} sessions`
+
+  return `${all} ${all === 1 ? 'session' : 'sessions'}`
+}
 // session-kanban:end
 
 // merged-views:begin
@@ -1069,6 +1105,22 @@ function readCollapsed() {
   }
 }
 
+// Every stored choice is seeded here, called once from register(). An atom's
+// initializer runs at MODULE LOAD, before ctx exists, so `atom(readCollapsed())`
+// finds no storage and keeps its boot value: without this restore a fold choice
+// (and every other stored choice) never survives a reload.
+function restoreStoredState() {
+  // The lane table first: readStatuses validates a stored project lane against
+  // it, so a custom lane must already be in $lanes.
+  $lanes.set(readLanes())
+  $statuses.set(readStatuses())
+  $sort.set(readSort())
+  $view.set(readView())
+  $ghPreset.set(readGhPreset())
+  $openProject.set(readOpenProject())
+  $collapsed.set(readCollapsed())
+}
+
 function writeCollapsed(next) {
   if (!pluginDisposed && pluginCtx) pluginCtx.storage.set(COLLAPSE_KEY, next)
 }
@@ -1316,6 +1368,13 @@ function writeSessionLane(projectId, sessionId, status) {
 
     return
   }
+  // A move already in flight to this same lane is the same write. The menu and a
+  // drag can both reach here for one press, and a double POST would double the
+  // toast on a refusal; dropping the repeat keeps the first write authoritative.
+  const pending = $sessionStatus.get()[sessionId]
+
+  if (pending && pending.status === lane) return
+
   const at = Date.now()
 
   $sessionStatus.set({ ...$sessionStatus.get(), [sessionId]: { project_id: projectId, status: lane, at } })
@@ -1554,6 +1613,10 @@ function useSessionGoals(ids) {
     enabled: key.length > 0,
     queryFn: () => boardRest(`/goals?session_ids=${encodeURIComponent(key)}`),
     queryKey: [QUERY_ROOT, 'goals', key],
+    // A different set of ids is a different key, and the new read is a poll away.
+    // Keep the last answer on screen meanwhile, so a search that narrows the board
+    // never blinks every goal line off and back on.
+    placeholderData: previous => previous,
     refetchInterval: BOARD_MS,
     retry: false,
     staleTime: 8000
@@ -2005,8 +2068,9 @@ function projectForPath(folders, path) {
 }
 
 // Every folder a project owns, longest first, which is the order projectForPath
-// needs for the nearest project to win. One builder for the board and the
-// titlebar tool, so both match paths by the same rule.
+// needs for the nearest project to win. The TITLEBAR tool is its only caller: the
+// board resolves a card's project from the tree's `sessionIds` claim and the link
+// row, never by matching a path, so this list is not a board input.
 function projectFoldersOf(projects) {
   const out = []
 
@@ -3578,9 +3642,10 @@ function SortPicker({ sort }) {
 
 // One active /goal on one line: the target glyph, the title truncated by goalModel, the turn
 // budget and, only when the goal has criteria, how many are confirmed. The hover carries the full
-// title, the turn count and every gate's state. `data-pcc-noclick` is what keeps the card's own
-// click handler from opening the session when this line is the thing that was clicked: the goal
-// line is information, never a second door into the session.
+// title, the turn count and every gate's state. `data-pcc-noclick` is what keeps the handler that
+// owns this row from opening the session when this line is the thing that was clicked: the goal
+// line is information, never a second door into the session. Both row shapes honour it (the kanban
+// card's `closest` guard and the `RowButton` rows' own click guards below).
 function GoalMeta({ goal }) {
   if (!goal) return null
 
@@ -3601,6 +3666,16 @@ function GoalMeta({ goal }) {
   })
 }
 
+// A row-shaped click target opens its session. `RowButton` renders a real
+// `<button>`, so a nested-control test like the kanban card's cannot be reused
+// here: the row itself would match. The one thing inside these rows that must not
+// open anything is the goal line, and it marks itself `[data-pcc-noclick]`.
+function rowClickOpens(event) {
+  const target = event && event.target
+
+  return !(target && target.closest && target.closest('[data-pcc-noclick]'))
+}
+
 function SessionCard({ session, state, showProject, onOpen, lane, goal }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
@@ -3608,7 +3683,9 @@ function SessionCard({ session, state, showProject, onOpen, lane, goal }) {
 
   return jsxs(RowButton, {
     className: 'pcc-card',
-    onClick: () => onOpen(session.id),
+    onClick: event => {
+      if (rowClickOpens(event)) onOpen(session.id)
+    },
     style: S.card,
     title: sessionTitle(session),
     children: [
@@ -3790,7 +3867,7 @@ function ProjectColumn({ project, index, status, lane, laneRows, linkRows, refs,
     [project.sessionCount, linkRows, refs, lane, laneRows]
   )
   const summary =
-    sessionLaneSummary(project.sessionCount, tally, lane) ||
+    sessionLaneSummary(project.sessionCount, tally, lane, laneRows) ||
     `${project.sessionCount || 0} ${project.sessionCount === 1 ? 'session' : 'sessions'}`
   const liveCount = useMemo(() => {
     let n = 0
@@ -6060,6 +6137,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
               jsx(StartSessionButton, {
                 folder,
                 issue: { ...detail, html_url: detail.url },
+                kind,
                 owner,
                 projectId,
                 repo
@@ -6699,7 +6777,7 @@ function issueUrl(owner, repo, number) {
 // tools, so a truncated body here would only invite it to answer from the
 // truncation. Header, one context line, one instruction, then two newlines so
 // the caret lands on an empty last line waiting for the user's question.
-function issueDraftText({ labels, number, owner, repo, state, title, url }) {
+function issueDraftText({ kind, labels, number, owner, repo, state, title, url }) {
   const link = url || issueUrl(owner, repo, number)
   const name = String(title || '').trim().slice(0, 120)
   const tags = (Array.isArray(labels) ? labels : [])
@@ -6710,8 +6788,14 @@ function issueDraftText({ labels, number, owner, repo, state, title, url }) {
     .filter(Boolean)
     .join(' · ')
   const lines = [`#${number} ${name}`.trim(), link, owner && repo ? `repo: ${owner}/${repo}` : '', meta].filter(Boolean)
+  // A pull request is not an issue: the opener names the object GitHub actually
+  // has, or the agent is told to read the wrong thread.
+  const read =
+    kind === 'pr'
+      ? 'Read this pull request with gh before you start.'
+      : 'Read this issue and its linked pull requests with gh before you start.'
 
-  return `${lines.join('\n')}\n\nRead this issue and its linked pull requests with gh before you start. Move this card with pcc_set_status.\n\n`
+  return `${lines.join('\n')}\n\n${read} Move this card with pcc_set_status.\n\n`
 }
 
 // The app's own "new chat" door: a fresh draft in this profile with no session
@@ -7002,8 +7086,21 @@ function createWorktree(folder, options) {
   })
 }
 
-function openIssueDraft({ folder, issue, owner, projectId, repo }) {
+// The board link a New-session click owes. The kind is the clicked object's own,
+// never a fixed 'issue': a session opened from a pull request must be stored as
+// a PR link, or the card shows the wrong chip and the wrong lane derivation.
+function issueSessionLink(issue, kind, projectId) {
+  return {
+    kind: kind === 'pr' ? 'pr' : 'issue',
+    number: Number(issue && issue.number) || 0,
+    projectId
+  }
+}
+
+function openIssueDraft({ folder, issue, kind, owner, projectId, repo }) {
+  const ref = kind === 'pr' ? 'pr' : 'issue'
   const text = issueDraftText({
+    kind: ref,
     labels: issue.labels,
     number: Number(issue.number) || 0,
     owner,
@@ -7017,11 +7114,7 @@ function openIssueDraft({ folder, issue, owner, projectId, repo }) {
   // text already in its composer. No folder means the board has no anchor to
   // offer, so the detached draft is the only honest door left.
   if (folder) {
-    return openSessionInFolder(folder, text, {
-      kind: 'issue',
-      number: Number(issue.number) || 0,
-      projectId
-    })
+    return openSessionInFolder(folder, text, issueSessionLink(issue, ref, projectId))
   }
 
   openNewChat()
@@ -7029,7 +7122,7 @@ function openIssueDraft({ folder, issue, owner, projectId, repo }) {
   return seedDraftText(text)
 }
 
-function StartSessionButton({ folder, issue, owner, projectId, repo }) {
+function StartSessionButton({ folder, issue, kind, owner, projectId, repo }) {
   const [busy, setBusy] = useState(false)
 
   if (!folder || !issue || !Number(issue.number)) return null
@@ -7038,11 +7131,16 @@ function StartSessionButton({ folder, issue, owner, projectId, repo }) {
     if (event && event.stopPropagation) event.stopPropagation()
     if (busy) return
     setBusy(true)
-    openIssueDraft({ folder, issue, owner, projectId, repo })
+    openIssueDraft({ folder, issue, kind, owner, projectId, repo })
       .then(ok => {
         // The session is open either way; one quiet note only when the text
         // never reached the composer, so the click is never a silent no-op.
-        if (!ok) host.notify({ kind: 'info', message: 'New session opened, but the issue text did not reach the composer.' })
+        if (!ok) {
+          host.notify({
+            kind: 'info',
+            message: `New session opened, but the ${kind === 'pr' ? 'pull request' : 'issue'} text did not reach the composer.`
+          })
+        }
       })
       .catch(err =>
         host.notify({
@@ -7054,11 +7152,11 @@ function StartSessionButton({ folder, issue, owner, projectId, repo }) {
   }
 
   return jsxs(Button, {
-    'aria-label': `Start a new session about issue ${issue.number}`,
+    'aria-label': `Start a new session about ${kind === 'pr' ? 'pull request' : 'issue'} ${issue.number}`,
     disabled: busy,
     onClick: start,
     size: 'xs',
-    title: 'Open a new session with this issue in the composer',
+    title: `Open a new session with this ${kind === 'pr' ? 'pull request' : 'issue'} in the composer`,
     variant: 'outline',
     children: [
       jsx(Codicon, { name: busy ? 'loading' : 'comment-discussion', size: '0.75rem', spinning: busy }),
@@ -7166,7 +7264,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
           jsx('span', { style: S.grow }),
           // The same action sits in the modal footer, so it is always the same
           // one click from either place.
-          jsx(StartSessionButton, { folder, issue, owner, projectId, repo }),
+          jsx(StartSessionButton, { folder, issue, kind: 'issue', owner, projectId, repo }),
           prs.length > 0
             ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: `${prs.length} ${prs.length === 1 ? 'PR' : 'PRs'}` })
             : jsx('span', { children: 'no PR' })
@@ -8765,6 +8863,10 @@ function folderList(project) {
   }
 
   add(project.path)
+  // A `/board` project row reports every folder as `paths`; reading them here is
+  // what keeps a merged store-only project from shrinking to its first folder on
+  // the next sync.
+  for (const path of project.paths || []) add(path)
   for (const repo of project.repos || []) add(repo.path)
 
   return out
@@ -8797,7 +8899,9 @@ function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel, g
 
   return jsxs(RowButton, {
     className: 'pcc-detail-row',
-    onClick: () => onOpen(session.id),
+    onClick: event => {
+      if (rowClickOpens(event)) onOpen(session.id)
+    },
     style: S.sessionRow,
     title: sessionTitle(session),
     children: [
@@ -8935,25 +9039,15 @@ function ProjectDetailPage() {
         if (!s || !s.id || seen.has(s.id)) continue
         seen.add(s.id)
         const link = linkBySession.get(s.id) || null
-        const number = Number(link && link.pr)
-        const pr = projectRefs && Number.isFinite(number) && number > 0 ? projectRefs.get(number) || null : null
-        const issueNumber = Number(link && link.issue)
-        const issue = projectRefs && Number.isFinite(issueNumber) && issueNumber > 0 ? projectRefs.get(issueNumber) || null : null
 
-        const card = buildKanbanCard({
-          session: s,
+        const card = projectPanelCard(s, {
           link,
+          refs: projectRefs,
           project,
-          projectId: project ? project.id : projectId,
+          projectId,
           folder: folderPath,
-          pr,
-          issue,
           projectLane,
-          // An unknown branch is no chip: never the invented text "main".
-          branch: sessionBranch(s, ''),
-          // The raw /goals row: buildKanbanCard normalizes it exactly as the Status board's cards
-          // are normalized, so one builder owns the line model.
-          goal: goals.rows[s.id] || null,
+          goals: goals.rows,
           now,
           lanes: laneRows
         })
@@ -9749,8 +9843,11 @@ function goalCounts(goal) {
   return goal.subgoalsText ? `${goal.turnsText} · ${goal.subgoalsText}` : goal.turnsText
 }
 
-// The comma list one read sends: de-duplicated, capped at the backend's own 60, in the caller's
-// order (the views pass newest first, so the cap keeps the newest sessions' goals).
+// The comma list one read sends: de-duplicated, capped at the backend's own 60,
+// then SORTED so the key is the set of sessions, not their order. Without the
+// sort, typing in search or reordering the cards changes the query key and every
+// goal line blinks off until the new read lands. The cap keeps the caller's
+// newest-first head, which is the 60 the backend would answer anyway.
 function goalReadKey(ids) {
   const out = []
   const seen = new Set()
@@ -9764,7 +9861,7 @@ function goalReadKey(ids) {
     if (out.length >= GOAL_IDS_LIMIT) break
   }
 
-  return out.join(',')
+  return out.sort().join(',')
 }
 // session-goals:end
 
@@ -9814,6 +9911,120 @@ function buildKanbanCard(input) {
     // placeholder: a card with no goal must look exactly as it did before this feature.
     goal: goalModel(source.goal)
   }
+}
+
+// The project list the Status view renders: the tree's rows, plus a project only
+// the store knows. The store's row keeps EVERY path it reported (`paths`), so a
+// merged row is never narrower than the project really is: /board/projects
+// replaces a project's paths, and a row carrying the first folder alone would
+// strip the rest on the next sync.
+function sessionProjectList(treeProjects, boardProjects) {
+  const out = (Array.isArray(treeProjects) ? treeProjects : []).filter(project => project && project.id).map(project => ({ ...project }))
+  const seen = new Set(out.map(project => project.id))
+
+  for (const row of Array.isArray(boardProjects) ? boardProjects : []) {
+    if (!row || !row.project_id || seen.has(row.project_id)) continue
+    const paths = (Array.isArray(row.paths) ? row.paths : []).map(path => String(path || '').trim()).filter(Boolean)
+    const path = paths[0] || String(row.path || '').trim()
+
+    out.push({ id: row.project_id, label: row.label, path, paths: paths.length ? paths : path ? [path] : [] })
+    seen.add(row.project_id)
+  }
+
+  return out
+}
+
+// The Status view's whole card list, pure: session.list rows plus the four
+// indexes the hook already built. The project id comes from the link row or the
+// tree's `sessionIds` claim and is handed to the builder EXPLICITLY: a session
+// with no link row has no `project_id` for the builder to fall back on, so a call
+// site that leaves it out leaves every unlinked session reading "No project",
+// unmovable and invisible to the project filter. One function, so the test can
+// run the hook's real input shape instead of hand-passing the field.
+function kanbanCardsFrom(rows, context) {
+  const source = context || {}
+  const join = source.join || { bySession: new Map(), previewById: new Map() }
+  const linkBySession = source.linkBySession || new Map()
+  const projectById = source.projectById || new Map()
+  const refsByProject = source.refsByProject || new Map()
+  const statuses = source.statuses || {}
+  const branches = source.branches || {}
+  const overrides = source.overrides || {}
+  const lanes = source.lanes
+  const now = Number(source.now) || Date.now()
+
+  return (Array.isArray(rows) ? rows : [])
+    .filter(session => session && session.id)
+    .map(session => {
+      const link = linkBySession.get(session.id) || null
+      // The link row names the project; without one, the tree's `sessionIds`
+      // claim does. Naming that project here is what makes the card's lane
+      // writable (the store creates the missing link row on the POST).
+      const projectId = sessionProjectId(session.id, link, join)
+      const project = projectId ? projectById.get(projectId) || null : null
+      const preview = join.previewById.get(String(session.id)) || null
+      const folder = project ? primaryPath(project) : ''
+      const refs = projectId ? refsByProject.get(projectId) : null
+      const number = Number(link && link.pr)
+      const pr = refs && Number.isFinite(number) && number > 0 ? refs.get(number) || null : null
+      const issueNumber = Number(link && link.issue)
+      const issue = refs && Number.isFinite(issueNumber) && issueNumber > 0 ? refs.get(issueNumber) || null : null
+      const card = buildKanbanCard({
+        session,
+        link,
+        project,
+        projectId,
+        folder,
+        pr,
+        issue,
+        projectLane: projectId ? statuses[projectId] : '',
+        // The preview row knows the session's checkout; the folder's current
+        // branch is the fallback. Neither means no chip rather than a fake main.
+        branch: sessionBranch(preview, folder ? branches[folder] : ''),
+        // The preview row is the only payload with a last-active stamp.
+        lastActivity: sessionStamp(preview || session),
+        now,
+        lanes
+      })
+      const override = overrides[session.id]
+
+      return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
+    })
+}
+
+// One card of the project page's lane panel, from one `projects.project_sessions`
+// row. The same builder the Status board uses, with the row's own newest stamp:
+// without `lastActivity` the builder falls back to the start time, so a session
+// that was busy an hour ago but started last week reads stale and sorts last.
+function projectPanelCard(row, context) {
+  const source = context || {}
+  const session = row || {}
+  const link = source.link || null
+  const refs = source.refs || null
+  const number = Number(link && link.pr)
+  const pr = refs && Number.isFinite(number) && number > 0 ? refs.get(number) || null : null
+  const issueNumber = Number(link && link.issue)
+  const issue = refs && Number.isFinite(issueNumber) && issueNumber > 0 ? refs.get(issueNumber) || null : null
+  const project = source.project || null
+
+  return buildKanbanCard({
+    session,
+    link,
+    project,
+    projectId: project ? project.id : String(source.projectId || ''),
+    folder: String(source.folder || ''),
+    pr,
+    issue,
+    projectLane: source.projectLane,
+    // An unknown branch is no chip: never the invented text "main".
+    branch: sessionBranch(session, ''),
+    // The raw /goals row: buildKanbanCard normalizes it exactly as the Status
+    // board's cards are normalized, so one builder owns the line model.
+    goal: (source.goals && source.goals[session.id]) || null,
+    lastActivity: sessionStamp(session),
+    now: source.now,
+    lanes: source.lanes
+  })
 }
 
 function KanbanSelect({ ariaLabel, disabled, onChange, options, style, title, value }) {
@@ -10162,13 +10373,9 @@ function KanbanCardMenu({ card, lanes, onMove, onOpenProject, onOpenSession }) {
                 jsxs(
                   DropdownMenuItem,
                   {
-                    // `onSelect` is the menu's own callback; the click handler is
-                    // the belt for a host whose menu fires one but not the other.
-                    // `onMove` no-ops when the lane is already this one.
-                    onClick: event => {
-                      if (event && event.stopPropagation) event.stopPropagation()
-                      onMove(card, lane.id)
-                    },
+                    // ONE path per pick. Radix runs `onSelect`; the click handler
+                    // this used to also carry ran on the same press, so every
+                    // pick posted twice and a refusal toasted twice.
                     onSelect: () => onMove(card, lane.id),
                     children: [
                       jsx(
@@ -10634,26 +10841,20 @@ function useSessionCards(lanes) {
     () => (boardState.data && Array.isArray(boardState.data.projects) ? boardState.data.projects : []),
     [boardState.data]
   )
-  // The tree knows labels and folders; the store may know a project the tree no
-  // longer lists, and its id is still what a link row names.
-  const projects = useMemo(() => {
-    const out = treeProjects.map(project => ({ ...project }))
-    const seen = new Set(out.map(project => project.id))
-
-    for (const row of boardProjects) {
-      if (!row || !row.project_id || seen.has(row.project_id)) continue
-      out.push({ id: row.project_id, label: row.label, path: (row.paths && row.paths[0]) || '' })
-      seen.add(row.project_id)
-    }
-
-    return out
-  }, [treeProjects, boardProjects])
+  // The tree knows labels, folders and every folder a project owns; the store may
+  // know a project the tree no longer lists, and its id is still what a link row
+  // names. A store-only row therefore keeps the paths the store reported, so the
+  // merged list can never narrow a project to one folder.
+  const projects = useMemo(() => sessionProjectList(treeProjects, boardProjects), [treeProjects, boardProjects])
   const projectById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
   // The Status view's own copy of the featured-project sync: without it, a
   // session moved here can answer `unknown_project`, because nothing in this
   // view ever told the store which projects exist. ProjectsPage mounts the same
   // helper; the signature debounce in it makes the second mount a no-op.
-  useProjectSync(projects)
+  // The TREE only: /board/projects REPLACES a project's paths, and a merged
+  // store-only row carries the first folder alone, so syncing the merged list
+  // would strip every other folder that project owns.
+  useProjectSync(treeProjects)
   // The tree's own join, built once: `sessionIds` maps a session to the project
   // that claims it and `previewSessions` carries the checkout and stamps a
   // session.list row does not have. The Home bucket (`isNoProject`) claims every
@@ -10663,47 +10864,24 @@ function useSessionCards(lanes) {
   const refsByProject = useProjectRefs(projects, boardState.links)
   const branches = useProjectBranches(projects)
 
-  const cards = useMemo(() => {
-    const rows = (
-      sessionsQuery.data && Array.isArray(sessionsQuery.data.sessions) ? sessionsQuery.data.sessions : []
-    ).filter(session => session && session.id)
-    const now = Date.now()
-
-    return rows.map(session => {
-      const link = linkBySession.get(session.id) || null
-      // The link row names the project; without one, the tree's `sessionIds`
-      // claim does. Naming that project here is what makes the card's lane
-      // writable (the store creates the missing link row on the POST).
-      const projectId = sessionProjectId(session.id, link, join)
-      const project = projectId ? projectById.get(projectId) || null : null
-      const preview = join.previewById.get(String(session.id)) || null
-      const folder = project ? primaryPath(project) : ''
-      const refs = projectId ? refsByProject.get(projectId) : null
-      const number = Number(link && link.pr)
-      const pr = refs && Number.isFinite(number) && number > 0 ? refs.get(number) || null : null
-      const issueNumber = Number(link && link.issue)
-      const issue = refs && Number.isFinite(issueNumber) && issueNumber > 0 ? refs.get(issueNumber) || null : null
-      const card = buildKanbanCard({
-        session,
-        link,
-        project,
-        folder,
-        pr,
-        issue,
-        projectLane: projectId ? statuses[projectId] : '',
-        // The preview row knows the session's checkout; the folder's current
-        // branch is the fallback. Neither means no chip rather than a fake main.
-        branch: sessionBranch(preview, folder ? branches[folder] : ''),
-        // The preview row is the only payload with a last-active stamp.
-        lastActivity: sessionStamp(preview || session),
-        now,
-        lanes
-      })
-      const override = overrides[session.id]
-
-      return override ? { ...card, lane: override.status, laneSource: 'user', laneNote: '' } : card
-    })
-  }, [sessionsQuery.data, linkBySession, projectById, join, refsByProject, statuses, branches, overrides, lanes])
+  const cards = useMemo(
+    () =>
+      kanbanCardsFrom(
+        sessionsQuery.data && Array.isArray(sessionsQuery.data.sessions) ? sessionsQuery.data.sessions : [],
+        {
+          branches,
+          join,
+          lanes,
+          linkBySession,
+          now: Date.now(),
+          overrides,
+          projectById,
+          refsByProject,
+          statuses
+        }
+      ),
+    [sessionsQuery.data, linkBySession, projectById, join, refsByProject, statuses, branches, overrides, lanes]
+  )
 
   return { boardState, cards, live, projectById, projects, sessionsQuery, tree }
 }
@@ -10809,14 +10987,7 @@ function SessionsKanbanPage() {
 
   const total = cards.length
   const shown = filtered.length
-  const countLabel =
-    total === 0
-      ? ''
-      : shown === total
-        ? total >= SESSION_LIST_LIMIT
-          ? `newest ${total} sessions`
-          : `${total} ${total === 1 ? 'session' : 'sessions'}`
-        : `${shown} of ${total} sessions`
+  const countLabel = sessionCountLabel(total, shown)
   const projectOptions = [
     { value: '', label: 'All projects' },
     ...projects.map(project => ({ value: project.id, label: project.label || project.id }))
@@ -11087,9 +11258,12 @@ function focusedProjectId(sessionId) {
 
 // The titlebar click. It opens the focused session's project page, or says why
 // there is none and shows the board: the session tab leaves the route already
-// here, so a `to` on the tool would be a no-op.
+// here, so a `to` on the tool would be a no-op. The two "none" cases are
+// different sentences: no focused session is not a session without a project.
 function openFocusedSessionProject() {
-  return focusedProjectId(focusedSessionId())
+  const sessionId = focusedSessionId()
+
+  return focusedProjectId(sessionId)
     .catch(() => '')
     .then(projectId => {
       if (projectId) {
@@ -11099,7 +11273,12 @@ function openFocusedSessionProject() {
       }
 
       openView('projects')
-      host.notify({ kind: 'info', message: 'This session is not in a project yet, so the board opened instead.' })
+      host.notify({
+        kind: 'info',
+        message: sessionId
+          ? 'This session is not in a project yet, so the board opened instead.'
+          : 'No session is focused yet, so the board opened instead.'
+      })
     })
 }
 
@@ -11137,12 +11316,9 @@ export default {
     }
     // The lane table is restored first: readStatuses validates a stored project
     // lane against the lane table, so a custom lane must already be in $lanes.
-    $lanes.set(readLanes())
-    $statuses.set(readStatuses())
-    $sort.set(readSort())
-    $view.set(readView())
-    $ghPreset.set(readGhPreset())
-    $openProject.set(readOpenProject())
+    // One function, so a new stored choice cannot be forgotten here (the fold map
+    // was: its atom initialized before ctx existed and nothing re-read it).
+    restoreStoredState()
 
     ctx.registerMany([
       { id: 'titlebar', area: TITLEBAR_TOOL_AREA, order: 40, data: titlebarTool() },

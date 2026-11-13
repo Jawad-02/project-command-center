@@ -42,12 +42,28 @@ function slice(begin, end) {
   return block
 }
 
+// One whole function, from its `function` line to its top-level closing brace.
+function fn(name) {
+  const start = source.indexOf(`function ${name}(`)
+
+  assert.ok(start >= 0, `${name} missing from desktop/plugin.js`)
+  const end = source.indexOf('\n}\n', start)
+
+  assert.ok(end > start, `${name} has no closing brace`)
+
+  return source.slice(start, end + 3)
+}
+
 const laneBlock = slice('// session-lane:begin', '// session-lane:end')
 const kanbanBlock = slice('// session-kanban:begin', '// session-kanban:end')
 const viewsBlock = slice('// merged-views:begin', '// merged-views:end')
 
+// sessionCountLabel reads the module's read cap, so the vm gets the same number
+// the file declares rather than a second copy of 200.
+const LIST_LIMIT = Number(source.match(/const SESSION_LIST_LIMIT = (\d+)/)[1])
+
 vm.runInThisContext(
-  `${laneBlock}\n${kanbanBlock}\n${viewsBlock}\n;globalThis.__PCC_MERGED__ = {
+  `${laneBlock}\n${kanbanBlock}\n${viewsBlock}\nconst SESSION_LIST_LIMIT = ${LIST_LIMIT}\n;globalThis.__PCC_MERGED__ = {
     VIEWS,
     DEFAULT_VIEW,
     VIEW_IDS,
@@ -71,7 +87,11 @@ vm.runInThisContext(
     laneUseText,
     laneRowsFromResponse,
     kanbanLaneFor,
-    kanbanCounts
+    kanbanCounts,
+    sessionBranch,
+    sessionCountLabel,
+    movedLane,
+    LIST_LIMIT: SESSION_LIST_LIMIT
   }`,
   { filename: PLUGIN }
 )
@@ -426,16 +446,45 @@ test('the project page session panel offers By branch and By lane', () => {
 })
 
 // ── the low-severity review items, each pinned where it lives ──────────────
+//
+// Each case runs the code where the code CAN run in node. The remaining source
+// assertions are the ones whose subject only exists inside a React render (a JSX
+// prop, a mutation callback, the SDK open chain), and each names that reason.
 
 test('D16: laneFailure maps the route\'s own project_status and links onto the error', () => {
-  const begin = source.indexOf('function laneFailure(')
-  const block = source.slice(begin, source.indexOf('\n}\n', begin) + 3)
+  // Executed: the whole lane_in_use path, counts and sentence together.
+  const { laneFailure, laneUseCounts, laneUseText } = new Function(
+    `${fn('laneUseCounts')}\n${fn('laneUseText')}\n${fn('laneFailure')}\nreturn { laneFailure, laneUseCounts, laneUseText }`
+  )()
+  const refused = laneFailure({ ok: false, code: 'lane_in_use', project_status: 2, links: 3 })
 
-  assert.match(block, /err\.counts = laneUseCounts\(res\)/, 'the route shape is mapped, not read as res.counts')
-  assert.doesNotMatch(block, /res\.counts/, 'the message key the route never sends is gone')
+  assert.deepEqual(refused.counts, { projects: 2, sessions: 3 }, 'the route shape is mapped, not read as res.counts')
+  assert.equal(refused.code, 'lane_in_use')
+  assert.equal(refused.message, 'That lane still has sessions.')
+  // The popover's sentence is built from the SAME two numbers.
+  assert.equal(laneUseText('Review', refused.counts), '3 sessions and 2 projects use Review.')
+  assert.deepEqual(laneUseCounts({ project_status: 1, links: 0 }), { projects: 1, sessions: 0 })
+  // The message key the route never sends is not read as a count.
+  assert.deepEqual(laneFailure({ code: 'lane_in_use', counts: { projects: 9, sessions: 9 } }).counts, { projects: 0, sessions: 0 })
+  // The route's own sentence wins, and an unknown code still says something.
+  assert.equal(laneFailure({ code: 'lane_in_use', error: '  pick another lane  ' }).message, 'pick another lane')
+  assert.equal(laneFailure({ code: 'nope' }).message, 'The board refused the lane change.')
 })
 
+// D17 - the slug is executed; the provisional-column half is a mutation callback
+// inside a React component (`createLane`), which node cannot run: its three lines
+// are pinned as source, and the reason is that there is no component to mount.
 test('D17: a created lane keeps its provisional column, and only the route refuses a duplicate', () => {
+  assert.equal(M.laneSlug('Shipping now'), 'shipping-now')
+  assert.equal(M.laneSlug('  A really long lane label that runs past the cap  ').length, 24)
+  const cut = M.laneSlug('a-'.repeat(20))
+
+  assert.equal(cut.length, 23, 'the slug is cut to 24 and a trailing dash removed')
+  assert.doesNotMatch(cut, /-$/, 'a dash the cut leaves is stripped')
+  assert.match(cut, /^[a-z][a-z0-9-]*$/)
+  assert.equal(M.laneSlug('3d printing'), '', 'a digit-first label has no id the route would accept')
+  assert.equal(M.laneSlug('---'), '')
+
   assert.match(source, /provisionalLanes\.add\(added\.id\)/, 'the optimistic id is marked provisional')
   assert.match(source, /withProvisionalLanes\(serverRows\)/, 'a reread merges the provisional row back in')
   assert.match(source, /provisionalLanes\.delete\(added\.id\)/, 'the marker dies when the POST settles')
@@ -443,11 +492,20 @@ test('D17: a created lane keeps its provisional column, and only the route refus
 })
 
 test('D18: a session list at the read limit says newest, not the whole history', () => {
+  // Executed: the label function the view renders.
+  assert.equal(M.sessionCountLabel(0, 0), '')
+  assert.equal(M.sessionCountLabel(1, 1), '1 session')
+  assert.equal(M.sessionCountLabel(4, 4), '4 sessions')
+  assert.equal(M.sessionCountLabel(4, 2), '2 of 4 sessions', 'a filter says how much it shows')
+  assert.equal(M.sessionCountLabel(M.LIST_LIMIT, M.LIST_LIMIT), `newest ${M.LIST_LIMIT} sessions`, 'the cap is named')
+  assert.equal(M.sessionCountLabel(M.LIST_LIMIT, 3), `3 of ${M.LIST_LIMIT} sessions`)
+  // The read that produces a 200-row list uses the one constant.
   assert.match(source, /const SESSION_LIST_LIMIT = 200/, 'the read limit is one constant')
   assert.match(source, /limit: SESSION_LIST_LIMIT/, 'the read uses it')
-  assert.match(source, /total >= SESSION_LIST_LIMIT[\s\S]{0,80}newest \$\{total\} sessions/, 'the count is honest at the limit')
 })
 
+// D19 - these are ABSENCES: deleted helpers and a duplicated style key that has no
+// behaviour to observe, because the defect is code that should not exist.
 test('D19: the dead helpers and the duplicate style keys are gone', () => {
   assert.doesNotMatch(source, /function kanbanLane\(/, 'kanbanLane had no caller')
   assert.doesNotMatch(source, /function mergeKanbanOrder\(/, 'mergeKanbanOrder had no caller')
@@ -459,17 +517,35 @@ test('D19: the dead helpers and the duplicate style keys are gone', () => {
   assert.doesNotMatch(source, /catch\(err => \{\s*throw err\s*\}\)/, 'the empty rethrow catch is gone')
 })
 
+// D20 - the subject is a JSX prop pair on two controls, so there is no function to
+// call: a disabled state and its title only exist when the component renders.
 test('D20: a disabled lane control says why it cannot act', () => {
   assert.match(source, /title: card\.projectId \? undefined : 'A lane cannot be saved without a project/, 'the table select explains its disabled state')
   assert.match(source, /Lanes cannot be removed while the board backend is not answering/, 'a dead backend is the tip, not Remove X')
 })
 
 test('D21: an unknown branch draws no chip, never the invented main', () => {
+  // Executed: the one reader every card uses.
+  assert.equal(M.sessionBranch({ git_branch: 'feat/x' }, 'trunk'), 'feat/x')
+  assert.equal(M.sessionBranch({}, 'trunk'), 'trunk', 'the folder branch is the fallback')
+  assert.equal(M.sessionBranch({ git_branch: '   ' }, '  '), '', 'nothing known means no chip')
+  assert.equal(M.sessionBranch(null, ''), '')
+  // The absence of a literal 'main' default anywhere in the file.
   assert.doesNotMatch(source, /\|\| 'main'/, 'no branch falls back to main')
-  assert.match(source, /function sessionBranch\(preview, projectBranch\)/, 'the branch reader owns the empty case')
 })
 
+// D23 - movedLane is pure and executed; the two call sites are a map inside a
+// component render, so their wiring is asserted next to the behaviour it uses.
 test('D23: the projects view and the detail rows read the pending-move cache', () => {
+  const resolved = { lane: 'active', note: 'a note', source: 'project' }
+
+  assert.deepEqual(M.movedLane({ s1: { status: 'review' } }, 's1', resolved), { lane: 'review', note: '', source: 'user' })
+  assert.equal(M.movedLane({ s1: { status: 'review' } }, 's2', resolved), resolved, 'an unrelated session keeps its lane')
+  assert.equal(M.movedLane({}, 's1', resolved), resolved)
+  assert.equal(M.movedLane(null, 's1', resolved), resolved)
+  // A pending row with no status is not a move.
+  assert.equal(M.movedLane({ s1: {} }, 's1', resolved), resolved)
+
   const column = source.slice(source.indexOf('function ProjectColumn('), source.indexOf('\n}\n', source.indexOf('function ProjectColumn(')))
   const detail = source.slice(source.indexOf('function ProjectDetailPage('), source.indexOf('\nconst panelCounts', source.indexOf('function ProjectDetailPage(')))
 
@@ -478,6 +554,9 @@ test('D23: the projects view and the detail rows read the pending-move cache', (
   assert.match(detail, /lane: move\.status, laneSource: 'user'/, 'the lane panel card applies the same move')
 })
 
+// D24 - the subject is the SDK open chain: `openSession` resolves inside the app,
+// and the ordering it needs (never write the composer before the tab exists) is a
+// promise chain with no pure half to hand an input to.
 test('D24: openSession answers whether the tab opened, and the draft waits for it', () => {
   const begin = source.indexOf('function openLinkedSession(')
   const block = source.slice(begin, source.indexOf('\n}\n', begin) + 3)

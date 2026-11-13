@@ -259,13 +259,42 @@ test('D9: a stored lane is kept when the store accepts it, and an unknown lane n
 
 // D10 - a hook body cannot run in node (no renderer, no react-query), so this is
 // a source slice: the Status view must mount the same project sync ProjectsPage
-// already mounts, or its moves answer unknown_project.
-test('D10: the Status view syncs its projects before a move can name one', () => {
+// already mounts, or its moves answer unknown_project. It must sync the TREE
+// only, never the merged list: /board/projects replaces a project's paths, and a
+// store-only row carries one folder, so syncing the merge strips the rest.
+test('D10: the Status view syncs the tree projects before a move can name one', () => {
   const hook = fn('useSessionCards')
 
-  assert.match(hook, /useProjectSync\(projects\)/, 'the featured projects reach the store from this view too')
+  assert.match(hook, /useProjectSync\(treeProjects\)/, 'the featured projects reach the store from this view too')
+  assert.doesNotMatch(hook, /useProjectSync\(projects\)/, 'the merged list would narrow a store-only project to one folder')
   // The sync helper itself is one implementation, not a second copy.
   assert.match(fn('useProjectSync'), /boardRest\('\/board\/projects'/)
+})
+
+// D10b - executed: the merged project list and the sync payload built from it. A
+// project only the store knows arrives as `{project_id, label, paths}`; /board/
+// projects REPLACES paths, so a merged row narrowed to paths[0] would strip the
+// rest on the next sync. The hook now syncs the tree only, and the merged row
+// keeps every path it reported.
+test('D10: a store-only project keeps every folder it reported', () => {
+  const sessionProjectList = new Function(`${fn('sessionProjectList')}\nreturn sessionProjectList`)()
+  const projectSyncRows = new Function(`${fn('folderList')}\n${fn('projectSyncRows')}\nreturn projectSyncRows`)()
+  const tree = [{ id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha', sessionIds: [], previewSessions: [] }]
+  const board = [
+    { project_id: 'p1', label: 'Alpha', paths: ['/home/nyll/dev/alpha'] },
+    { project_id: 'p2', label: 'Beta', paths: ['/home/nyll/dev/beta', '/home/nyll/dev/beta-docs'] }
+  ]
+  const merged = sessionProjectList(tree, board)
+
+  assert.deepEqual(merged.map(project => project.id), ['p1', 'p2'])
+  assert.deepEqual(merged[1].paths, ['/home/nyll/dev/beta', '/home/nyll/dev/beta-docs'])
+  assert.equal(merged[1].path, '/home/nyll/dev/beta', 'the first folder is still the primary one')
+  // The payload the route receives: both folders, never the first alone.
+  assert.deepEqual(projectSyncRows(merged)[1].paths, ['/home/nyll/dev/beta', '/home/nyll/dev/beta-docs'])
+  // A tree row is copied, not aliased: the caller's payload is not mutated.
+  assert.notEqual(merged[0], tree[0])
+  // A board row with no paths keeps whatever single path it has.
+  assert.deepEqual(sessionProjectList([], [{ project_id: 'p3', label: 'Gamma', path: '/g' }])[0].paths, ['/g'])
 })
 
 // D11 - the link body is pure; the request around it is executed with the REST
@@ -323,7 +352,7 @@ test('D11: a created session is linked, and a refused link keeps the session and
   })
 })
 
-test('D11: projectId reaches the link from the modal and the issue row', () => {
+test('D11: projectId reaches the link from the modal and both Start-session doors', () => {
   const open = fn('openSessionInFolder')
 
   assert.match(open, /if \(link && typeof link === 'object'\) linkCreatedSession\(id, link\.projectId, link\.kind, link\.number\)/)
@@ -331,8 +360,68 @@ test('D11: projectId reaches the link from the modal and the issue row', () => {
   assert.match(fn('GhDetailModal'), /jsx\(GhLinkSessionMenu, \{ detail, folder, kind, number, owner, projectId, repo \}\)/)
   assert.match(fn('GhDetailThread'), /jsx\(StartSessionButton, \{[\s\S]*?projectId/)
   assert.match(fn('GithubSection'), /projectId,\n\s+repo: repoName/)
-  assert.match(fn('GhIssueRow'), /jsx\(StartSessionButton, \{ folder, issue, owner, projectId, repo \}\)/)
-  assert.match(fn('openIssueDraft'), /kind: 'issue',\n\s+number: Number\(issue\.number\) \|\| 0,\n\s+projectId/)
+  // The issue row is an issue; the modal footer hands the THREAD's own kind over,
+  // so a session opened from a pull request is not stored as an issue link.
+  assert.match(fn('GhIssueRow'), /jsx\(StartSessionButton, \{ folder, issue, kind: 'issue', owner, projectId, repo \}\)/)
+  assert.match(fn('GhDetailThread'), /jsx\(StartSessionButton, \{[\s\S]*?kind,/)
+  assert.match(fn('openIssueDraft'), /openSessionInFolder\(folder, text, issueSessionLink\(issue, ref, projectId\)\)/, 'the kind is not hardcoded')
+})
+
+// D11b - executed: the draft door's own handler, with the session door stubbed, so
+// the link object a PR click produces is the object the real one produces. Before
+// the fix `openIssueDraft` hardcoded `kind: 'issue'`, so this asserts the PR body.
+test('D11: a session opened from a pull request is linked as a PR, not an issue', async () => {
+  const issueDraftText = new Function(`${fn('issueUrl')}\n${fn('issueDraftText')}\nreturn issueDraftText`)()
+  const issueSessionLink = new Function(`${fn('issueSessionLink')}\nreturn issueSessionLink`)()
+  const openIssueDraft = new Function(
+    'issueDraftText',
+    'issueSessionLink',
+    'openSessionInFolder',
+    'openNewChat',
+    'seedDraftText',
+    `${fn('openIssueDraft')}\nreturn openIssueDraft`
+  )
+  const opened = []
+  const run = (kind, number) =>
+    openIssueDraft(
+      issueDraftText,
+      issueSessionLink,
+      (folder, text, link) => {
+        opened.push({ folder, link, text })
+
+        return Promise.resolve(true)
+      },
+      () => {},
+      () => Promise.resolve(true)
+    )({
+      folder: '/home/nyll/dev/alpha',
+      issue: { number, title: 'Fix the thing', state: 'open', labels: [], html_url: `https://github.com/o/r/pull/${number}` },
+      kind,
+      owner: 'o',
+      projectId: 'p1',
+      repo: 'r'
+    })
+
+  await run('pr', 6)
+
+  assert.deepEqual(opened[0].link, { kind: 'pr', number: 6, projectId: 'p1' })
+  assert.deepEqual(M.kanbanLinkBody('p1', 's1', opened[0].link.kind, opened[0].link.number), {
+    session_id: 's1',
+    project_id: 'p1',
+    pr: 6
+  })
+  assert.match(opened[0].text, /Read this pull request with gh/, 'the draft names the object it links')
+  assert.doesNotMatch(opened[0].text, /Read this issue/)
+
+  await run('issue', 12)
+
+  assert.deepEqual(opened[1].link, { kind: 'issue', number: 12, projectId: 'p1' })
+  assert.deepEqual(M.kanbanLinkBody('p1', 's1', opened[1].link.kind, opened[1].link.number), {
+    session_id: 's1',
+    project_id: 'p1',
+    issue: 12
+  })
+  assert.match(opened[1].text, /Read this issue and its linked pull requests with gh/)
 })
 
 // D12 - the composer path is executed: getDraft decides between replacing the

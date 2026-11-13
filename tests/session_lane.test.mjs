@@ -229,3 +229,23 @@ test('the column summary is one short line', () => {
   assert.equal(L.sessionLaneSummary(4, {}, 'active'), '4 sessions')
   assert.equal(L.sessionLaneSummary(2, null), '2 sessions')
 })
+
+// The lane table travels with the line. Without it a custom project lane is not a
+// lane at all: sessionLaneId drops it, so the column repeated the lane it already
+// names AND printed the raw id instead of the label its author typed.
+test('a custom project lane is left out of its own header and named by its label', () => {
+  const lanes = [
+    { id: 'unfiled', label: 'Unfiled', order: 0 },
+    { id: 'active', label: 'Active', order: 1 },
+    { id: 'triage', label: 'Waiting on Ali', order: 2 }
+  ]
+  const dot = '\u00b7'
+
+  // The project's own lane is dropped from the line, custom or not.
+  assert.equal(L.sessionLaneSummary(4, { triage: 2, active: 1 }, 'triage', lanes), `4 sessions ${dot} 1 active`)
+  // A custom lane's count is still surfaced, by its label, never its id.
+  assert.equal(L.sessionLaneSummary(4, { triage: 2, active: 2 }, 'active', lanes), `4 sessions ${dot} 2 waiting on ali`)
+  // The system words do not change, and a table-less caller keeps the old answer.
+  assert.equal(L.sessionLaneSummary(3, { active: 2, review: 1 }, 'active', lanes), `3 sessions ${dot} 1 review`)
+  assert.equal(L.sessionLaneSummary(3, { active: 2, review: 1 }, 'active'), `3 sessions ${dot} 1 review`)
+})

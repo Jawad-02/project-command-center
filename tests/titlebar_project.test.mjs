@@ -165,3 +165,32 @@ test('no project opens the board and says so instead of doing nothing', async ()
     ['info:This session is not in a project yet, so the board opened instead.']
   )
 })
+
+// Two different "no project" cases, two different sentences. With nothing focused
+// the old line claimed a session was open and missing a project, which is not what
+// the click found.
+test('no focused session is not the same message as a session without a project', async () => {
+  reset({ focusedId: '', projects: [] })
+
+  await T.openFocusedSessionProject()
+
+  assert.deepEqual(opened, [])
+  assert.deepEqual(viewed, ['projects'], 'the board still opens')
+  assert.deepEqual(
+    notified.map(message => `${message.kind}:${message.message}`),
+    ['info:No session is focused yet, so the board opened instead.']
+  )
+
+  // A focused session with no project of its own keeps its own wording.
+  reset({
+    focusedId: 's7',
+    projects: [{ id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha', sessionIds: [], previewSessions: [] }]
+  })
+
+  await T.openFocusedSessionProject()
+
+  assert.deepEqual(
+    notified.map(message => `${message.kind}:${message.message}`),
+    ['info:This session is not in a project yet, so the board opened instead.']
+  )
+})

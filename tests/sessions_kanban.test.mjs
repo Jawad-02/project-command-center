@@ -102,6 +102,17 @@ vm.runInThisContext(
 )
 const C = globalThis.__PCC_CARD__
 
+// The Status view's own card list, executed with the shapes the hook really
+// receives: session.list rows, the tree join, link rows, project rows and the
+// board's project lanes. Every card assertion in this suite goes through it, so a
+// field the call site forgets to pass fails here instead of in the renderer.
+vm.runInThisContext(
+  `${fn('primaryPath')}\n${fn('sessionProjectId')}\n${fn('sessionBranch')}\n${fn('buildKanbanCard')}\n${fn('kanbanCardsFrom')}\n${fn('projectPanelCard')}
+;globalThis.__PCC_CARDS__ = { kanbanCardsFrom, projectPanelCard }`,
+  { filename: PLUGIN }
+)
+const CARDS = globalThis.__PCC_CARDS__
+
 const DEFAULT_IDS = ['unfiled', 'backlog', 'active', 'review', 'blocked', 'done', 'canceled']
 const ids = lanes => lanes.map(lane => lane.id)
 
@@ -278,27 +289,34 @@ test('a session with no link row is placed by the tree sessionIds claim, with it
   const session = { id: 's1', title: 'Kanban work', preview: '', started_at: 1_699_000_000, message_count: 12, source: 'gui', _lineage_root_id: null }
   const projectId = K.sessionProjectId(session.id, null, join)
   const preview = join.previewById.get(session.id)
-  const built = C.buildKanbanCard({
-    session,
-    link: null,
-    project,
-    projectId,
-    folder: project.path,
-    branch: K.sessionBranch(preview, 'trunk'),
-    lastActivity: C.sessionStamp(preview || session),
+  // Through the hook's own builder with NO projectId in the input: that field is
+  // what the call site forgot, and it is why an unlinked session on the Status
+  // view read "No project", could not be moved and was skipped by the filter.
+  const built = CARDS.kanbanCardsFrom([session], {
+    branches: {},
+    join,
+    lanes,
+    linkBySession: new Map(),
     now,
-    lanes
-  })
+    overrides: {},
+    projectById: new Map(projects.map(row => [row.id, row])),
+    refsByProject: new Map(),
+    statuses: { p1: 'active' }
+  })[0]
 
   assert.equal(projectId, 'p1')
-  assert.equal(built.projectId, 'p1')
+  assert.equal(built.projectId, 'p1', 'the hook hands the tree-resolved project id to the builder')
   assert.equal(built.projectLabel, 'Alpha')
   assert.equal(built.folder, '/home/nyll/dev/alpha')
-  assert.equal(built.linked, false)
+  assert.equal(built.linked, false, 'no link row, and still placed')
+  assert.equal(built.lane, 'active', 'the project lane places the card, so it is movable')
   assert.equal(built.branch, 'feat/session-kanban')
   // Last activity is the preview's newest stamp, not the list row's start time.
   assert.equal(built.lastActivity, 1_700_060_000_000)
   assert.ok(built.lastActivity > C.stampMs(session.started_at))
+  // The project filter sees it, because the card names the project.
+  assert.deepEqual(K.kanbanFilterCards([built], { projectId: 'p1' }).map(row => row.id), ['s1'])
+  assert.equal(K.kanbanFilterCards([built], { projectId: 'p2' }).length, 0)
 
   // The link row still wins, and a session nothing claims stays unplaced.
   assert.equal(K.sessionProjectId('s1', { project_id: 'p2' }, join), 'p2')
@@ -587,16 +605,21 @@ test('the filter predicate hides every unchecked lane and nothing else', () => {
 // A card is a click target for opening its session, and the menu lives inside
 // it. Regression: a lane row in that menu opened the session instead of moving
 // the card, so the card must ignore clicks that start on a nested control.
-test('a click on a nested control never opens the card session', () => {
+// A second regression: the lane row carried BOTH onClick and onSelect, so Radix
+// ran both and one pick posted twice. Exactly one path fires it now, and
+// writeSessionLane drops a repeat of a move already pending to the same lane.
+test('a click on a nested control never opens the card session, and one pick moves once', () => {
   const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
   const card = source.slice(source.indexOf('function KanbanCard('), source.indexOf('function KanbanColumn('))
   const menu = source.slice(source.indexOf('function KanbanCardMenu('), source.indexOf('function KanbanCard('))
+  const laneRow = menu.slice(menu.indexOf('...lanes.map(lane =>'), menu.indexOf('jsx(Separator'))
 
   assert.match(card, /target\.closest/, 'the card tests where the click started')
   assert.match(card, /role="menuitem"/, 'menu rows are excluded')
   assert.match(card, /data-pcc-noclick/, 'the trigger is excluded')
-  assert.match(menu, /onClick: event => \{[\s\S]*onMove\(card, lane\.id\)/, 'the lane row moves on click')
-  assert.match(menu, /onSelect: \(\) => onMove\(card, lane\.id\)/, 'and on the menu callback')
+  assert.equal((laneRow.match(/onMove\(card, lane\.id\)/g) || []).length, 1, 'one path per pick')
+  assert.match(laneRow, /onSelect: \(\) => onMove\(card, lane\.id\)/, 'the menu callback is the path')
+  assert.doesNotMatch(laneRow, /onClick:/, 'a click handler beside onSelect fires the move twice')
 })
 
 test('column folding: empty lanes fold, unfiled and backlog start folded', () => {
@@ -780,4 +803,144 @@ test('a lane change posts, and a change that cannot post tells the user why', as
   assert.equal(refused.notices.length, 1, 'a refusal is not silent')
   assert.match(refused.notices[0].message, /carded under p2/, 'the store\'s own words reach the user')
   assert.equal(refused.store.value.s1, undefined, 'and the card goes back')
+})
+
+// One pick is one write. The menu row used to carry onClick AND onSelect, and
+// Radix runs both for a single press: two POSTs, and two toasts on a refusal.
+// The row now has one path, and the write itself drops a repeat of a move that is
+// already pending to the same lane, so a double fire from any source cannot post
+// twice. Both halves are asserted here: the guard by calling it twice, the menu by
+// reading the row's handlers (a menu cannot render without a React root).
+test('a move already pending to the same lane is not posted again', async () => {
+  const grab = name => {
+    const start = source.indexOf(`function ${name}(`)
+
+    assert.ok(start >= 0, `${name} missing from desktop/plugin.js`)
+
+    return source.slice(start, source.indexOf('\n}\n', start) + 3)
+  }
+
+  const writeSessionLane = new Function(
+    '$lanes', '$sessionStatus', 'boardRest', 'kanbanMoveBody', 'laneIdIn', 'queryClient',
+    'host', 'laneLabel', 'QUERY_ROOT',
+    `${grab('laneFailure')}\n${grab('writeSessionLane')}\nreturn writeSessionLane`
+  )
+  const posted = []
+  const notices = []
+  const store = { value: {}, get() { return this.value }, set(v) { this.value = v } }
+  const move = writeSessionLane(
+    { get: () => K.KANBAN_LANES },
+    store,
+    (path, opts) => {
+      posted.push(opts.body)
+
+      return Promise.resolve({ ok: true })
+    },
+    K.kanbanMoveBody,
+    (lanes, status) => status,
+    { invalidateQueries() {} },
+    { notify: message => notices.push(message) },
+    id => id,
+    'root'
+  )
+
+  move('p1', 's1', 'review')
+  move('p1', 's1', 'review')
+
+  assert.equal(posted.length, 1, 'one pending move, one POST')
+  assert.equal(notices.length, 0)
+
+  // A different lane is a different write: the guard drops only the repeat.
+  move('p1', 's1', 'done')
+
+  assert.equal(posted.length, 2, 'a second, different move still posts')
+  assert.deepEqual(posted[1], { project_id: 'p1', session_id: 's1', status: 'done', scope: 'session' })
+})
+
+// The fold map is a stored choice like the sort and the view. Its atom is created
+// at module load, before ctx exists, so its initializer reads no storage: without
+// the restore in register() a fold choice is forgotten on the next reload.
+test('every stored choice, the fold map included, is restored when the plugin registers', () => {
+  const grab = name => {
+    const start = source.indexOf(`function ${name}(`)
+
+    assert.ok(start >= 0, `${name} missing from desktop/plugin.js`)
+
+    return source.slice(start, source.indexOf('\n}\n', start) + 3)
+  }
+  const mkAtom = () => {
+    let value
+
+    return { get: () => value, set: next => { value = next } }
+  }
+  const atoms = {
+    $collapsed: mkAtom(),
+    $ghPreset: mkAtom(),
+    $lanes: mkAtom(),
+    $openProject: mkAtom(),
+    $sort: mkAtom(),
+    $statuses: mkAtom(),
+    $view: mkAtom()
+  }
+  const restoreStoredState = new Function(
+    ...Object.keys(atoms),
+    'readLanes', 'readStatuses', 'readSort', 'readView', 'readGhPreset', 'readOpenProject', 'readCollapsed',
+    `${grab('restoreStoredState')}\nreturn restoreStoredState`
+  )
+  const stored = { lanes: [{ id: 'active' }], collapsed: { active: true, backlog: false }, preset: 'prs', project: 'p1', sort: 'activity', statuses: { p1: 'active' }, view: 'status' }
+
+  restoreStoredState(
+    ...Object.values(atoms),
+    () => stored.lanes,
+    () => stored.statuses,
+    () => stored.sort,
+    () => stored.view,
+    () => stored.preset,
+    () => stored.project,
+    () => stored.collapsed
+  )()
+
+  assert.deepEqual(atoms.$collapsed.get(), stored.collapsed, 'a folded lane is still folded after a reload')
+  assert.equal(atoms.$view.get(), 'status')
+
+  // And register is what calls it: without this line the restores never run.
+  const register = source.slice(source.indexOf('  register(ctx) {'), source.indexOf('    ctx.registerMany(['))
+  assert.match(register, /restoreStoredState\(\)/, 'register seeds every stored choice')
+})
+
+// The project page's lane panel builds its cards from projects.project_sessions
+// rows, which carry last_active. Leaving that out made the builder fall back to
+// started_at, so a session busy an hour ago but started last week read stale and
+// sorted last in its lane.
+test('a project panel card carries its row\'s newest activity, not its start time', () => {
+  const now = 1_700_100_000_000
+  const lanes = K.normalizeKanbanLanes([])
+  const project = { id: 'p1', label: 'Alpha', path: '/home/nyll/dev/alpha' }
+  const startedAt = Math.floor((now - 10 * 24 * 60 * 60 * 1000) / 1000)
+  const activeAt = Math.floor((now - 60 * 60 * 1000) / 1000)
+  const build = row =>
+    CARDS.projectPanelCard(row, {
+      folder: project.path,
+      goals: {},
+      lanes,
+      link: null,
+      now,
+      project,
+      projectId: 'p1',
+      projectLane: 'active',
+      refs: null
+    })
+
+  const busy = build({ id: 's1', title: 'Busy', started_at: startedAt, last_active: activeAt })
+  const idle = build({ id: 's2', title: 'Idle', started_at: startedAt })
+
+  assert.equal(busy.lastActivity, activeAt * 1000, 'the row last_active is the card stamp')
+  assert.equal(busy.stale, false, 'active an hour ago is not stale, whatever its start time')
+  assert.equal(idle.lastActivity, startedAt * 1000)
+  assert.equal(idle.stale, true, 'a row with no activity since its start is stale')
+  // The lane panel sorts newest first, so the two rows keep their real order.
+  assert.deepEqual(
+    K.sortKanbanCards([idle, busy], lanes, 1).map(card => card.id),
+    ['s1', 's2']
+  )
 })

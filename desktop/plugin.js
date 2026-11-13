@@ -254,20 +254,29 @@ function laneForLink(link, refs, projectLane, allowed) {
 // Every session in a project, counted per lane. Linked rows resolve through the
 // helper; the sessions the links do not name still sit on the project lane, so
 // the tally covers the whole column rather than the visible cards only.
-function sessionLaneTally(sessionCount, links, refs, projectLane) {
+function sessionLaneTally(sessionCount, links, refs, projectLane, lanes) {
+  // The server owns the lane table, so the counts are seeded from it rather
+  // than the constants: a custom lane the project uses gets a column here
+  // instead of being folded into the project lane's number.
+  const allowed = (Array.isArray(lanes) ? lanes : [])
+    .map(row => String((row && row.id) || row || '').trim().toLowerCase())
+    .filter(Boolean)
   const counts = Object.fromEntries(Object.keys(SESSION_LANE_LABELS).map(lane => [lane, 0]))
+
+  for (const id of allowed) if (!Object.prototype.hasOwnProperty.call(counts, id)) counts[id] = 0
+
   let linked = 0
 
   for (const link of links || []) {
     if (!link || !link.session_id) continue
     linked += 1
-    const lane = laneForLink(link, refs, projectLane)
+    const lane = laneForLink(link, refs, projectLane, allowed)
 
     if (lane) counts[lane.lane] += 1
   }
 
   const rest = Math.max(0, (Number(sessionCount) || 0) - linked)
-  const unnamed = rest > 0 ? resolveSessionLane(null, null, projectLane) : null
+  const unnamed = rest > 0 ? resolveSessionLane(null, null, projectLane, allowed) : null
 
   if (unnamed) counts[unnamed.lane] += rest
 
@@ -281,8 +290,14 @@ function sessionLaneSummary(sessionCount, counts, projectLane) {
   const total = Number(sessionCount) || 0
   const parts = total > 0 ? [`${total} ${total === 1 ? 'session' : 'sessions'}`] : []
   const own = sessionLaneId(projectLane)
+  // Signal order first, then any lane the server table added beyond it, so a
+  // custom lane's count is never silently dropped from the line.
+  const order = [
+    ...SESSION_LANE_TALLY_ORDER,
+    ...Object.keys(counts || {}).filter(lane => !SESSION_LANE_TALLY_ORDER.includes(lane))
+  ]
 
-  for (const lane of SESSION_LANE_TALLY_ORDER) {
+  for (const lane of order) {
     if (lane === own) continue
     if (parts.length >= 3) break
     const n = counts && Number(counts[lane])
@@ -692,6 +707,20 @@ function kanbanMoveBody(projectId, sessionId, status) {
   return { project_id: projectId, session_id: sessionId, status, scope: 'session' }
 }
 
+// The link a freshly created session owes the board: one row per session, and
+// the referenced issue or PR number keyed by its kind. `kind` is the two words
+// /board/link reads, so an issue session is linked to its issue, a PR session to
+// its pull request.
+function kanbanLinkBody(projectId, sessionId, kind, number) {
+  const body = { session_id: String(sessionId || ''), project_id: String(projectId || '') }
+  const key = kind === 'pr' ? 'pr' : 'issue'
+  const value = Number(number)
+
+  if (Number.isFinite(value) && value > 0) body[key] = value
+
+  return body
+}
+
 // session.list rows carry an id, a title and a start time: no cwd, no branch and
 // no last-active stamp. The tree is the only place those live, so build its two
 // indexes once per read rather than guessing per card: `sessionIds` names every
@@ -881,13 +910,16 @@ const $sessionStatus = atom({})
 // an override outlives the POST for one bounded window and dies on its echo.
 const SESSION_POST_TTL_MS = 30000
 
-function readStatuses() {
+function readStatuses(allowed) {
   const raw = pluginCtx ? pluginCtx.storage.get(STATUS_KEY, {}) : {}
+  // The lanes are board data now: a project on a custom lane, or on canceled or
+  // unfiled, must read back as that lane instead of being dropped to Active.
+  const ids = Array.isArray(allowed) ? allowed : laneIds($lanes.get())
   const out = {}
 
   if (raw && typeof raw === 'object') {
     for (const [id, status] of Object.entries(raw)) {
-      if (STATUS_BY_ID[status]) out[id] = status
+      if (ids.includes(status)) out[id] = status
     }
   }
 
@@ -918,16 +950,63 @@ function saveStatuses(next) {
   if (!pluginDisposed && pluginCtx) pluginCtx.storage.set(STATUS_KEY, next)
 }
 
+// A refused project-lane write, in the store's own words. `code` is the route's
+// code; the sentence the user sees is its `error`.
+function statusFailure(res) {
+  const text =
+    res && typeof res.error === 'string' && res.error.trim()
+      ? res.error.trim()
+      : {
+          unknown_project: 'that project is not on the board yet.',
+          bad_status: 'the board does not list that lane.',
+          empty_project: 'the card has no project.'
+        }[String((res && res.code) || '')] || 'the board did not answer.'
+
+  const err = new Error(text)
+
+  err.code = String((res && res.code) || '')
+
+  return err
+}
+
 function writeStatus(projectId, status) {
-  if (!STATUS_BY_ID[status]) return
-  const next = { ...$statuses.get(), [projectId]: status }
+  // The lane table is the authority, not the five constants: a custom lane and
+  // canceled/unfiled are lanes a project can sit in.
+  if (!laneIds($lanes.get()).includes(status)) return
+  const snapshot = $statuses.get()
+  const next = { ...snapshot, [projectId]: status }
 
   $statuses.set(next)
   saveStatuses(next)
-  // Optimistic on the server too. A 404 (old process) is swallowed: the storage
-  // copy above already carries the change, so the picker never blocks on it.
+  // Optimistic on the server too. The response is checked: a refusal puts the
+  // picker back and says why, so a lane change is never lost in silence.
   statusPostedAt.set(projectId, { at: Date.now(), status })
-  boardRest('/board/status', { method: 'POST', body: { project_id: projectId, status } }).catch(() => {})
+  boardRest('/board/status', { method: 'POST', body: { project_id: projectId, status } })
+    .then(res => {
+      if (!res || res.ok === false) throw statusFailure(res)
+      queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
+    })
+    .catch(err => {
+      // Revert only if nothing newer replaced this write; a second pick wins.
+      const current = $statuses.get()
+
+      if (current[projectId] === status) {
+        const back = { ...snapshot }
+
+        $statuses.set(back)
+        saveStatuses(back)
+      }
+
+      statusPostedAt.delete(projectId)
+      const reason = String((err && err.message) || 'the board did not answer')
+        .trim()
+        .replace(/\.+$/, '')
+
+      host.notify({
+        kind: 'warning',
+        message: `Could not save the project lane: ${reason}.`
+      })
+    })
 }
 
 // The lane table is server owned now (/board/lanes), so the stored copy is a
@@ -1269,10 +1348,13 @@ function reconcileSessionLanes(links) {
 // `statuses` is a list of rows on the current store and was an id-keyed map on
 // older builds; both are read here, so one payload shape change never costs the
 // board its links.
-function boardStatusMap(payload) {
+function boardStatusMap(payload, allowed) {
   const rows = payload && payload.statuses
 
   if (!rows || typeof rows !== 'object') return null
+  // The lane table, not the five constants: a project can sit in a custom lane,
+  // canceled or unfiled, and the map has to keep what the store said.
+  const ids = Array.isArray(allowed) ? allowed : laneIds($lanes.get())
   const entries = Array.isArray(rows)
     ? rows.map(row => [row && row.project_id, row])
     : Object.entries(rows)
@@ -1281,7 +1363,7 @@ function boardStatusMap(payload) {
   for (const [id, row] of entries) {
     const value = typeof row === 'string' ? row : row && row.status
 
-    if (id && STATUS_BY_ID[value]) out[id] = value
+    if (id && ids.includes(value)) out[id] = value
   }
 
   return out
@@ -1290,6 +1372,21 @@ function boardStatusMap(payload) {
 // One read feeds the status picker, the board chips and the project sync. Both
 // pages mount it; the queryKey is shared, so it stays one request.
 let boardSeedTried = false
+// The last store failure this window already reported, so a poll every 15s does
+// not repeat the same toast.
+let boardErrorNotified = ''
+
+// `ok: false` is the store failing, not an empty board: /board answers the
+// failure with `statuses: []` and `links: []`, and reading that as live is what
+// silently drops every link and every lane.
+function boardReadFailed(payload) {
+  return Boolean(payload && typeof payload === 'object' && payload.ok === false)
+}
+
+// The store's own sentence, or a plain one when the body carries none.
+function boardFailureText(payload) {
+  return String((payload && (payload.error || payload.message)) || 'the board did not answer').trim()
+}
 
 function useBoard() {
   const query = useQuery({
@@ -1300,13 +1397,40 @@ function useBoard() {
     staleTime: 8000
   })
 
-  const statuses = useMemo(() => boardStatusMap(query.data), [query.data])
-  const data = statuses ? query.data : null
+  const laneRows = useValue($lanes)
+  const laneAllowed = useMemo(() => laneIds(laneRows), [laneRows])
+  const failed = boardReadFailed(query.data)
+  const liveData = failed ? null : query.data
+  const statuses = useMemo(
+    () => boardStatusMap(liveData, laneAllowed),
+    [liveData, laneAllowed]
+  )
+  const data = statuses ? liveData : null
   const links = useMemo(() => (data && Array.isArray(data.links) ? data.links : []), [data])
 
   useEffect(() => {
     $boardLive.set(Boolean(data))
   }, [data])
+
+  // A failed read is announced once per distinct sentence: the poll keeps
+  // trying, and the user is told why every card fell back to its project lane.
+  // A later live read clears the record, so the next failure speaks again.
+  useEffect(() => {
+    if (!failed) {
+      boardErrorNotified = ''
+
+      return
+    }
+
+    const reason = boardFailureText(query.data).replace(/\.+$/, '')
+
+    if (boardErrorNotified === reason) return
+    boardErrorNotified = reason
+    host.notify({
+      kind: 'error',
+      message: `The board store could not be read: ${reason}. Lanes fall back to each project lane.`
+    })
+  }, [failed, query.data])
 
   // The server wins, except for a project changed moments ago: the POST may
   // still be in flight, and reverting a picker under the cursor is worse than a
@@ -1869,11 +1993,28 @@ function openSession(id) {
 
 // An existing session already has a tab to open; the text goes in after it
 // paints, through the same bounded retry every other seeded composer uses. No
-// turn is sent: the text is the user's to edit.
+// turn is sent: the text is the user's to edit. A session the user was typing in
+// keeps that draft: the thread text is added below it instead of replacing it.
 function openLinkedSession(sessionId, text) {
   openSession(sessionId)
 
-  return seedSessionDraft(sessionId, text)
+  const composer = host && host.composer
+
+  if (!composer || typeof composer.getDraft !== 'function') return seedSessionDraft(sessionId, text)
+
+  return Promise.resolve(composer.getDraft(sessionId))
+    .catch(() => null)
+    .then(existing => {
+      const kept = typeof existing === 'string' && existing.trim()
+
+      if (!kept) return seedSessionDraft(sessionId, text)
+
+      return seedSessionInsert(sessionId, text).then(ok => {
+        if (ok) host.notify({ kind: 'info', message: 'Your draft was kept; the thread text was added below it.' })
+
+        return ok
+      })
+    })
 }
 
 // ── styles ───────────────────────────────────────────────────────────────────
@@ -3276,8 +3417,19 @@ function LaneBadge({ lane, lanes }) {
   })
 }
 
+// A project lane's Badge variant: the five defaults carry their own tone, and a
+// lane the table added gets the neutral outline.
+function laneVariant(id) {
+  return (STATUS_BY_ID[id] && STATUS_BY_ID[id].variant) || 'outline'
+}
+
 function StatusPicker({ projectId, status }) {
-  const current = STATUS_BY_ID[status] || STATUS_BY_ID[DEFAULT_STATUS]
+  // The options are the lane table, not the five constants: a project on a
+  // custom lane (or canceled/unfiled) must show, and be able to keep, that lane.
+  const lanes = useValue($lanes)
+  const rows = useMemo(() => laneTableOrDefaults(lanes), [lanes])
+  const currentId = rows.some(row => row.id === status) ? status : DEFAULT_STATUS
+  const current = rows.find(row => row.id === currentId) || { id: DEFAULT_STATUS, label: 'Active' }
 
   return jsxs(DropdownMenu, {
     children: [
@@ -3289,24 +3441,24 @@ function StatusPicker({ projectId, status }) {
           style: { border: 0, padding: 0, background: 'transparent', cursor: 'pointer', borderRadius: 3, display: 'inline-flex' },
           type: 'button',
           children: jsxs(Badge, {
-            variant: current.variant,
+            variant: laneVariant(current.id),
             children: [current.label, jsx(Codicon, { name: 'chevron-down', size: '0.625rem' })]
           })
         })
       }),
       jsx(DropdownMenuContent, {
         align: 'start',
-        children: STATUSES.map(s =>
+        children: rows.map(row =>
           jsxs(
             DropdownMenuItem,
             {
-              onSelect: () => writeStatus(projectId, s.id),
+              onSelect: () => writeStatus(projectId, row.id),
               children: [
-                jsx(Codicon, { name: 'check', size: '0.75rem', style: { visibility: s.id === current.id ? 'visible' : 'hidden' } }),
-                s.label
+                jsx(Codicon, { name: 'check', size: '0.75rem', style: { visibility: row.id === currentId ? 'visible' : 'hidden' } }),
+                row.label
               ]
             },
-            s.id
+            row.id
           )
         )
       })
@@ -3518,14 +3670,19 @@ function ProjectIdRow({ counts, liveCount }) {
   })
 }
 
-function ProjectColumn({ project, index, status, lane, linkRows, refs, liveByStored, onOpenProject, onOpenSession, links, counts, laneFilter }) {
+function ProjectColumn({ project, index, status, lane, laneRows, linkRows, refs, liveByStored, onOpenProject, onOpenSession, links, counts, laneFilter }) {
   const recent = useMemo(() => recentSessions(project), [project])
   const cost = formatCost(project.totalCostUsd)
   // The badge for every row in this column, and the header line, come from the
   // same resolver: explicit session lane, then its linked item, then the project
-  // lane, then unfiled.
+  // lane, then unfiled. The lane table travels with it, so a custom lane id
+  // resolves as the lane it is instead of falling back to the project lane.
   const rowLinks = useMemo(() => linksBySession(linkRows), [linkRows])
-  const laneOf = useCallback(id => laneForLink(rowLinks.get(id), refs, lane), [rowLinks, refs, lane])
+  const allowedLanes = useMemo(() => laneIds(laneRows), [laneRows])
+  const laneOf = useCallback(
+    id => laneForLink(rowLinks.get(id), refs, lane, allowedLanes),
+    [rowLinks, refs, lane, allowedLanes]
+  )
   // The lane filter hides rows, never truncates them: every session the project
   // has is rendered when its lane is checked.
   const shown = useMemo(
@@ -3533,8 +3690,8 @@ function ProjectColumn({ project, index, status, lane, linkRows, refs, liveBySto
     [recent, laneOf, laneFilter]
   )
   const tally = useMemo(
-    () => sessionLaneTally(project.sessionCount, linkRows, refs, lane),
-    [project.sessionCount, linkRows, refs, lane]
+    () => sessionLaneTally(project.sessionCount, linkRows, refs, lane, laneRows),
+    [project.sessionCount, linkRows, refs, lane, laneRows]
   )
   const summary =
     sessionLaneSummary(project.sessionCount, tally, lane) ||
@@ -4934,9 +5091,14 @@ function ghWriteFailure(res, fallback) {
 }
 
 function ghReason(res) {
-  const err = res && res.error
-
-  return err && err.message ? err.message : String(err || 'the request failed')
+  // A rejected request arrives as an Error (no `.error` field), a write route as
+  // {ok:false, error}, a thrown sentence as {message}. All three have to read
+  // as the sentence they carry instead of "the request failed".
+  return (
+    (res && res.message) ||
+    (res && res.error && res.error.message) ||
+    String((res && res.error) || 'the request failed')
+  )
 }
 
 // One chip: '#123 · Title', a state dot and an issue/PR glyph. Hover opens a
@@ -5371,7 +5533,7 @@ function GhReactions({ commentId, folder, kind, number, reactions }) {
 // The modal's Link to session door: the sessions the board already links to
 // this number, then the option to start one in the project folder. It opens or
 // seeds a composer; it never sends a turn.
-function GhLinkSessionMenu({ detail, folder, kind, number, owner, repo }) {
+function GhLinkSessionMenu({ detail, folder, kind, number, owner, projectId, repo }) {
   const links = useBoardLinks()
   const lanes = useValue($lanes)
   const statuses = useValue($statuses)
@@ -5407,7 +5569,9 @@ function GhLinkSessionMenu({ detail, folder, kind, number, owner, repo }) {
 
   const startNew = () => {
     if (!path || busy) return
-    settle(openSessionInFolder(path, text), 'Could not open a session')
+    // The modal's Start one door creates the session and its board link in the
+    // same gesture, so the new card carries the #n chip the list would show.
+    settle(openSessionInFolder(path, text, { kind, number, projectId }), 'Could not open a session')
   }
 
   return jsxs(DropdownMenu, {
@@ -5619,7 +5783,7 @@ function GhModalMeta({ detail, kind, onOpen }) {
 // The loaded thread. Its own component so the refs query, the composer state and
 // the mutations only exist once there is a detail to talk about — no hook is
 // ever called conditionally.
-function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
+function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId, repo }) {
   const comments = Array.isArray(detail.comments) ? detail.comments : []
   const reviews = kind === 'pr' && Array.isArray(detail.reviews) ? detail.reviews : []
   const numbers = useMemo(
@@ -5795,6 +5959,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
                 folder,
                 issue: { ...detail, html_url: detail.url },
                 owner,
+                projectId,
                 repo
               })
             ]
@@ -5805,7 +5970,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
   })
 }
 
-function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, repo }) {
+function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, projectId, repo }) {
   const kind = entry.kind === 'pr' ? 'pr' : 'issue'
   const number = Number(entry.number) || 0
   const query = useQuery({
@@ -5879,7 +6044,7 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
                       })
                     : null,
                   detail
-                    ? jsx(GhLinkSessionMenu, { detail, folder, kind, number, owner, repo })
+                    ? jsx(GhLinkSessionMenu, { detail, folder, kind, number, owner, projectId, repo })
                     : null
                 ]
               }),
@@ -5898,7 +6063,7 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
             : null,
           query.isError && !detail ? jsx('div', { style: S.ghQuiet, children: `Could not load this ${ghKindWord(kind)}.` }) : null,
           failed ? jsx(GhFailure, { data: failed, folder }) : null,
-          detail ? jsx(GhDetailThread, { detail, folder, kind, number, onOpen, owner, repo }) : null
+          detail ? jsx(GhDetailThread, { detail, folder, kind, number, onOpen, owner, projectId, repo }) : null
         ]
       })
     ]
@@ -6518,13 +6683,12 @@ function seedDraftText(text) {
   })
 }
 
-// Write text into a composer addressed by session id. `openSession` returns
-// before the tab has painted its composer, and setDraft fails closed on an
-// address no surface answers yet, so the write runs on the bounded retry
-// schedule. submit() is never called: the text is the user's to edit.
-function seedSessionDraft(sessionId, text) {
-  if (!pluginCtx || !host.composer || typeof host.composer.setDraft !== 'function') return Promise.resolve(false)
-
+// One bounded retry around a composer verb addressed by session id. `openSession`
+// returns before the tab has painted its composer, and every verb fails closed
+// on an address no surface answers yet, so the write runs on this schedule and
+// the first answer that says true wins. submit() is never called: the text is
+// the user's to edit.
+function seedComposerWrite(sessionId, write) {
   return new Promise(resolve => {
     let attempt = 0
 
@@ -6535,41 +6699,93 @@ function seedSessionDraft(sessionId, text) {
         return
       }
 
-      Promise.resolve(host.composer.setDraft(sessionId, text))
-        .catch(() => false)
-        .then(ok => {
-          if (ok) {
-            if (typeof host.composer.focus === 'function') host.composer.focus(sessionId)
-            resolve(true)
+      write(sessionId).then(ok => {
+        if (ok) {
+          if (typeof host.composer.focus === 'function') host.composer.focus(sessionId)
+          resolve(true)
 
-            return
-          }
+          return
+        }
 
-          if (attempt >= DRAFT_RETRY_MS.length) {
-            resolve(false)
+        if (attempt >= DRAFT_RETRY_MS.length) {
+          resolve(false)
 
-            return
-          }
+          return
+        }
 
-          if (!schedule(run, DRAFT_RETRY_MS[attempt])) {
-            resolve(false)
+        if (!schedule(run, DRAFT_RETRY_MS[attempt])) {
+          resolve(false)
 
-            return
-          }
+          return
+        }
 
-          attempt += 1
-        })
+        attempt += 1
+      })
     }
 
     run()
   })
 }
 
+// Write text into a composer addressed by session id, replacing the draft.
+function seedSessionDraft(sessionId, text) {
+  if (!pluginCtx || !host.composer || typeof host.composer.setDraft !== 'function') return Promise.resolve(false)
+
+  return seedComposerWrite(sessionId, id => Promise.resolve(host.composer.setDraft(id, text)).catch(() => false))
+}
+
+// Add text below whatever the composer already holds. Used when the session's
+// draft has the user's own unsent text in it: replacing that would lose it, so a
+// build without insertText answers false instead of falling back to setDraft.
+function seedSessionInsert(sessionId, text) {
+  if (!pluginCtx || !host.composer || typeof host.composer.insertText !== 'function') return Promise.resolve(false)
+
+  return seedComposerWrite(sessionId, id =>
+    Promise.resolve(host.composer.insertText(id, text, { mode: 'block' })).catch(() => false)
+  )
+}
+
+// The board link a just-created session owes the issue or PR it was opened for.
+// The session is kept either way: a refused link is a notice, never a closed
+// tab, and the retry is a click in the modal's Link to session menu.
+function linkCreatedSession(sessionId, projectId, kind, number) {
+  const id = String(sessionId || '').trim()
+  const project = String(projectId || '').trim()
+  const ref = Number(number)
+
+  if (!id || !project || !Number.isFinite(ref) || ref <= 0) return Promise.resolve(false)
+
+  return boardRest('/board/link', { method: 'POST', body: kanbanLinkBody(project, id, kind, ref) })
+    .then(res => {
+      if (!res || res.ok === false) {
+        throw new Error(String((res && (res.error || res.message)) || 'the board did not answer'))
+      }
+
+      queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'board'] })
+
+      return true
+    })
+    .catch(err => {
+      const reason = String((err && err.message) || 'the board did not answer')
+        .trim()
+        .replace(/\.+$/, '')
+
+      host.notify({
+        kind: 'warning',
+        message: `The session opened, but it could not be linked to #${ref}: ${reason}.`
+      })
+
+      return false
+    })
+}
+
 // The stock session door: one session.create with an explicit cwd, the app's
 // own tab for the returned stored id, then the draft in that session's
 // composer. This is the same request core's startSessionInWorkspace makes, so
 // it works on a stock Desktop with no SDK patch and no extra install step.
-function openSessionInFolder(folder, text) {
+// `link` ({ projectId, kind, number }) is the board row the new session owes
+// when it was opened from an issue or a pull request.
+function openSessionInFolder(folder, text, link) {
   const path = String(folder || '').trim()
 
   if (!path) return Promise.reject(new Error('No folder to open a session in.'))
@@ -6609,6 +6825,10 @@ function openSessionInFolder(folder, text) {
     .then(res => {
       id = String((res && res.stored_session_id) || '').trim()
       if (!id) throw new Error('The new session came back without an id.')
+
+      // The link is posted the moment the id exists, and it never blocks or
+      // closes the tab: linkCreatedSession reports its own refusal.
+      if (link && typeof link === 'object') linkCreatedSession(id, link.projectId, link.kind, link.number)
 
       const route = ownerRoute()
       const options = { intent: 'tab' }
@@ -6683,7 +6903,7 @@ function createWorktree(folder, options) {
   })
 }
 
-function openIssueDraft({ folder, issue, owner, repo }) {
+function openIssueDraft({ folder, issue, owner, projectId, repo }) {
   const text = issueDraftText({
     labels: issue.labels,
     number: Number(issue.number) || 0,
@@ -6697,14 +6917,20 @@ function openIssueDraft({ folder, issue, owner, repo }) {
   // The anchored door: a session whose cwd is this project's folder, with the
   // text already in its composer. No folder means the board has no anchor to
   // offer, so the detached draft is the only honest door left.
-  if (folder) return openSessionInFolder(folder, text)
+  if (folder) {
+    return openSessionInFolder(folder, text, {
+      kind: 'issue',
+      number: Number(issue.number) || 0,
+      projectId
+    })
+  }
 
   openNewChat()
 
   return seedDraftText(text)
 }
 
-function StartSessionButton({ folder, issue, owner, repo }) {
+function StartSessionButton({ folder, issue, owner, projectId, repo }) {
   const [busy, setBusy] = useState(false)
 
   if (!folder || !issue || !Number(issue.number)) return null
@@ -6713,7 +6939,7 @@ function StartSessionButton({ folder, issue, owner, repo }) {
     if (event && event.stopPropagation) event.stopPropagation()
     if (busy) return
     setBusy(true)
-    openIssueDraft({ folder, issue, owner, repo })
+    openIssueDraft({ folder, issue, owner, projectId, repo })
       .then(ok => {
         // The session is open either way; one quiet note only when the text
         // never reached the composer, so the click is never a silent no-op.
@@ -6775,7 +7001,7 @@ function NewSessionButton({ branch, folder, owner, repo }) {
   })
 }
 
-function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, flash, owner, repo }) {
+function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, flash, owner, projectId, repo }) {
   const labels = issue.labels || []
   const shownLabels = labels.slice(0, 3)
   const restLabels = labels.length - shownLabels.length
@@ -6841,7 +7067,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
           jsx('span', { style: S.grow }),
           // The same action sits in the modal footer, so it is always the same
           // one click from either place.
-          jsx(StartSessionButton, { folder, issue, owner, repo }),
+          jsx(StartSessionButton, { folder, issue, owner, projectId, repo }),
           prs.length > 0
             ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: `${prs.length} ${prs.length === 1 ? 'PR' : 'PRs'}` })
             : jsx('span', { children: 'no PR' })
@@ -8009,6 +8235,7 @@ function GithubSection({ folder, mainSessions = [], projectId, sessionsByBranch 
                   onOpenPr: goPr,
                   owner: ownerName,
                   prs: linkedPrs.get(issue.number) || [],
+                  projectId,
                   repo: repoName,
                   sessionsByBranch
                 },
@@ -8359,6 +8586,7 @@ function GithubSection({ folder, mainSessions = [], projectId, sessionsByBranch 
                 onClose: closeEntry,
                 onOpen: openEntry,
                 owner: ownerName,
+                projectId,
                 repo: repoName
               },
               `${currentEntry.kind}-${currentEntry.number}`
@@ -8570,16 +8798,19 @@ function ProjectDetailPage() {
   const refsByProject = useProjectRefs(pageProjects, boardState.links)
   const projectLane = project ? statuses[project.id] : ''
   const projectRefs = project ? refsByProject.get(project.id) : null
+  // The lane table is read before the resolver now: a custom lane the project
+  // uses has to resolve as itself on every detail row, not as the project lane.
+  const laneState = useLaneTable()
+  const laneRows = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const laneAllowed = useMemo(() => laneIds(laneRows), [laneRows])
   const laneOf = useCallback(
-    id => laneForLink(linkBySession.get(id), projectRefs, projectLane),
-    [linkBySession, projectRefs, projectLane]
+    id => laneForLink(linkBySession.get(id), projectRefs, projectLane, laneAllowed),
+    [linkBySession, projectRefs, projectLane, laneAllowed]
   )
 
   // The lane mode of the panel: the same kanban the Status view renders, but
   // built from this project's session rows instead of session.list, and scoped
   // to the project's id so a move posts the right scope.
-  const laneState = useLaneTable()
-  const laneRows = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
   const panelCards = useMemo(() => {
     const now = Date.now()
     const out = []
@@ -9070,20 +9301,28 @@ function ProjectsPage({ embedded }) {
 
     return map
   }, [projects])
+  // The lane table is read before the resolvers, so a custom lane id a session
+  // carries resolves as itself in the live strip and in every column.
+  const laneState = useLaneTable()
+  const laneRows = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
+  const laneAllowed = useMemo(() => laneIds(laneRows), [laneRows])
   const laneForSession = useCallback(
     key => {
       const projectId = projectByStored.get(key)
 
-      return laneForLink(linkBySession.get(key), refsByProject.get(projectId), projectId ? statuses[projectId] : '')
+      return laneForLink(
+        linkBySession.get(key),
+        refsByProject.get(projectId),
+        projectId ? statuses[projectId] : '',
+        laneAllowed
+      )
     },
-    [projectByStored, linkBySession, refsByProject, statuses]
+    [projectByStored, linkBySession, refsByProject, statuses, laneAllowed]
   )
 
   // The lane checkboxes: every lane checked by default, persisted in storage so
   // the filter survives a reload. The predicate is applied per session inside the
   // columns, so a column never hides a project, only the rows it does not match.
-  const laneState = useLaneTable()
-  const laneRows = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
   const [lanePick, setLanePick] = useState(readLaneFilter)
   const laneFilter = useMemo(() => normalizeLaneFilter(lanePick, laneRows), [lanePick, laneRows])
   const toggleLane = id => {
@@ -9155,6 +9394,7 @@ function ProjectsPage({ embedded }) {
             index: i,
             counts: Object.prototype.hasOwnProperty.call(repoCounts, primaryPath(p)) ? repoCounts[primaryPath(p)] : null,
             lane: statuses[p.id],
+            laneRows,
             linkRows: linkRowsForProject.get(p.id) || NO_LINKS,
             links: linksForProject.get(p.id),
             liveByStored: live.byStored,
@@ -10171,6 +10411,11 @@ function useSessionCards(lanes) {
     return out
   }, [treeProjects, boardProjects])
   const projectById = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects])
+  // The Status view's own copy of the featured-project sync: without it, a
+  // session moved here can answer `unknown_project`, because nothing in this
+  // view ever told the store which projects exist. ProjectsPage mounts the same
+  // helper; the signature debounce in it makes the second mount a no-op.
+  useProjectSync(projects)
   // The tree's own join, built once: `sessionIds` maps a session to the project
   // that claims it and `previewSessions` carries the checkout and stamps a
   // session.list row does not have. The Home bucket (`isNoProject`) claims every
@@ -10636,8 +10881,10 @@ export default {
         pluginDisposed = true
       })
     }
-    $statuses.set(readStatuses())
+    // The lane table is restored first: readStatuses validates a stored project
+    // lane against the lane table, so a custom lane must already be in $lanes.
     $lanes.set(readLanes())
+    $statuses.set(readStatuses())
     $sort.set(readSort())
     $view.set(readView())
     $ghPreset.set(readGhPreset())

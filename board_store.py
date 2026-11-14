@@ -727,6 +727,17 @@ def _lane_known_on(conn: sqlite3.Connection, lane: str) -> bool:
     return conn.execute("SELECT 1 FROM lanes WHERE id = ?", (lane,)).fetchone() is not None
 
 
+def _lane_gone(state: str) -> dict[str, Any]:
+    """The lane a caller validated was deleted before this write transaction began.
+
+    ``set_status`` checks the lane in its own read and then opens ``BEGIN IMMEDIATE``
+    for the write, so a concurrent ``delete_lane`` can land in between. Re-checking
+    inside the transaction is what stops a row being stored with an id the board no
+    longer has while the answer still says ``ok``.
+    """
+    return _fail("bad_status", "That lane was just removed; pick another lane.", status=state)
+
+
 def _renumber_lanes(conn: sqlite3.Connection, ids: Sequence[str]) -> None:
     conn.executemany("UPDATE lanes SET position = ? WHERE id = ?",
                      [(position, lane) for position, lane in enumerate(ids)])
@@ -917,6 +928,8 @@ def set_status(project_id: Optional[str], status: Optional[str], note: Optional[
     now = time.time()
     with _session() as conn:
         with _write(conn):
+            if not _lane_known_on(conn, state):
+                return _lane_gone(state)
             if not _project_exists(conn, pid):
                 if not (auto_project and _project_table_empty(conn)):
                     return _fail("unknown_project", f"{pid!r} is not a synced project", project_id=pid)
@@ -939,6 +952,8 @@ def _set_session_status(pid: str, sid: str, state: str, note: Optional[str], src
     now = time.time()
     with _session() as conn:
         with _write(conn):
+            if not _lane_known_on(conn, state):
+                return _lane_gone(state)
             key, row = _resolve_link_on(conn, sid)
             if row is None:
                 if not pid:

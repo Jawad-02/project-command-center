@@ -652,6 +652,8 @@ test('a folded lane renders as a rail and unfolds when a card lands on it', () =
   const folded = column.slice(column.indexOf('if (collapsed) {'), column.indexOf("  return jsxs('div', {\n    className: 'pcc-kcol'"))
   const dropAt = source.indexOf('  const drop = laneId => {')
   const drop = source.slice(dropAt, source.indexOf('  const refresh = () => {', dropAt))
+  const actionsAt = source.indexOf('function laneActions(')
+  const actions = source.slice(actionsAt, source.indexOf('\n}\n', actionsAt))
 
   assert.ok(railWidth >= 36 && railWidth <= 44, `the rail is a rail: ${railWidth}px`)
   assert.match(railStyle, /flex: `0 0 \$\{RAIL_WIDTH\}px`/, 'the rail takes its own flex basis, not a column')
@@ -662,7 +664,12 @@ test('a folded lane renders as a rail and unfolds when a card lands on it', () =
   assert.doesNotMatch(folded, /Badge/, 'the rail does not carry the system/custom badge')
   assert.match(folded, /onDrop: event => \{[\s\S]*onDrop\(lane\.id\)/, 'the rail is still a drop target')
   assert.match(folded, /onClick: toggle/, 'and a click target that unfolds it')
-  assert.match(drop, /laneCollapsed\(laneId, collapsedLanes, true\)[\s\S]*writeCollapsed\(next\)/, 'a drop unfolds the lane it landed in')
+  assert.match(drop, /dropCard\(card, laneId\)/, 'the drop hands the card to the shared lane actions')
+  assert.match(
+    actions,
+    /laneCollapsed\(laneId, collapsed, true\)[\s\S]*writeCollapsed\(next\)/,
+    'a drop unfolds the lane it landed in'
+  )
 })
 
 // A move is a WRITE, so it refuses an id the live table does not list instead of

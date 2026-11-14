@@ -58,32 +58,29 @@ test('the project panel gets the same fold map and toggle as the status board', 
   assert.match(statusProps, /onToggleCollapse: toggleLane/)
 })
 
-test('the panel toggle writes the same storage key through the same two doors', () => {
-  const at = detail.indexOf('const panelToggleLane =')
-  const stop = detail.indexOf('const panelDrop =', at)
-
-  assert.ok(at >= 0 && stop > at, 'panelToggleLane exists before panelDrop')
-
-  const toggle = detail.slice(at, stop)
-
-  assert.match(toggle, /laneCollapsed\(laneId, collapsedLanes, hasCards\)/)
-  assert.match(toggle, /\$collapsed\.set\(next\)/)
-  assert.match(toggle, /writeCollapsed\(next\)/)
-})
-
-test('a drop on a folded rail unfolds the lane before it moves the card', () => {
+test('both boards take their move, fold and drop from the one laneActions helper', () => {
+  assert.match(detail, /const \{ drop: dropCard, move: panelMove, toggle: panelToggleLane \} = laneActions\(panelByLane, collapsedLanes\)/)
+  assert.match(status, /const \{ drop: dropCard, move, toggle: toggleLane \} = laneActions\(byLane, collapsedLanes\)/)
+  // The panel's drop is its own drag state, then the shared rule.
   const at = detail.indexOf('const panelDrop =')
   const stop = detail.indexOf('const repoInfo =', at)
 
   assert.ok(at >= 0 && stop > at, 'panelDrop exists')
 
   const drop = detail.slice(at, stop)
-  const unfold = drop.indexOf('laneCollapsed(laneId, collapsedLanes, true)')
-  const move = drop.indexOf('panelMove(card, laneId)')
 
-  assert.ok(unfold >= 0, 'panelDrop checks the fold state')
+  assert.match(drop, /setPanelDrag\(null\)/)
+  assert.match(drop, /dropCard\(card, laneId\)/, 'the panel moves through the shared drop')
+})
+
+test('a drop on a folded rail unfolds the lane before it moves the card', () => {
+  const helper = block('laneActions', 'function reconcileSessionLanes(')
+  const unfold = helper.indexOf('laneCollapsed(laneId, collapsed, true)')
+  const move = helper.indexOf('move(card, laneId)')
+
+  assert.ok(unfold >= 0, 'the shared drop checks the fold state')
   assert.ok(move > unfold, 'the unfold happens before the move')
-  assert.match(drop, /\$collapsed\.set\(next\)/)
-  assert.match(drop, /writeCollapsed\(next\)/)
-  assert.match(drop, /\[laneId\]: false/)
+  assert.match(helper, /\$collapsed\.set\(next\)/)
+  assert.match(helper, /writeCollapsed\(next\)/)
+  assert.match(helper, /\[laneId\]: false/)
 })

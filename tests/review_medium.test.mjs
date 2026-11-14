@@ -267,8 +267,10 @@ test('D10: the Status view syncs the tree projects before a move can name one', 
 
   assert.match(hook, /useProjectSync\(treeProjects\)/, 'the featured projects reach the store from this view too')
   assert.doesNotMatch(hook, /useProjectSync\(projects\)/, 'the merged list would narrow a store-only project to one folder')
-  // The sync helper itself is one implementation, not a second copy.
-  assert.match(fn('useProjectSync'), /boardRest\('\/board\/projects'/)
+  // The sync helper itself is one implementation, not a second copy: the POST
+  // lives in `syncProjects`, which the hook schedules.
+  assert.match(fn('useProjectSync'), /syncProjects\(rows, sig\)/, 'the hook schedules the one sync')
+  assert.match(fn('syncProjects'), /boardRest\('\/board\/projects'/)
 })
 
 // D10b - executed: the merged project list and the sync payload built from it. A

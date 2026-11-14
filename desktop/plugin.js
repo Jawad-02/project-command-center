@@ -319,16 +319,17 @@ function sessionLaneSummary(sessionCount, counts, projectLane, lanes) {
   return parts.join(' \u00b7 ')
 }
 
-// How a lane reads inside the summary line: the house word for a system lane
-// ("1 review"), and the label its author typed for a custom one, because there is
-// no house word for it and a raw id is not a word at all.
+// How a lane reads inside the summary line: the label the lane carries in the
+// live table, lowercased ("1 review", "2 qa check"). A renamed system lane is
+// its new name, not the seeded word; an id with no row is the id, because there
+// is no label to print and a raw id is still more honest than a guess.
 function sessionLaneWord(lane, table) {
   const row = (table || []).find(entry => entry.id === lane)
-  const label = row ? row.label : ''
+  const label = row && row.label ? String(row.label).trim() : ''
 
   if (!label) return String(lane)
 
-  return SESSION_LANE_LABELS[lane] ? String(lane) : label.toLowerCase()
+  return label.toLowerCase()
 }
 // session-lane:end
 
@@ -997,8 +998,17 @@ function statusFailure(res) {
 
 function writeStatus(projectId, status) {
   // The lane table is the authority, not the five constants: a custom lane and
-  // canceled/unfiled are lanes a project can sit in.
-  if (!laneIds($lanes.get()).includes(status)) return
+  // canceled/unfiled are lanes a project can sit in. A pick that names a lane the
+  // table no longer has is refused out loud: the menu can outlive a delete, and a
+  // silent return leaves the picker looking like it agreed.
+  if (!laneIds($lanes.get()).includes(status)) {
+    host.notify({
+      kind: 'warning',
+      message: `The board has no "${status}" lane any more, so the project lane was not changed.`
+    })
+
+    return
+  }
   const snapshot = $statuses.get()
   const next = { ...snapshot, [projectId]: status }
 
@@ -1368,9 +1378,10 @@ function writeSessionLane(projectId, sessionId, status) {
 
     return
   }
-  // A move already in flight to this same lane is the same write. The menu and a
-  // drag can both reach here for one press, and a double POST would double the
-  // toast on a refusal; dropping the repeat keeps the first write authoritative.
+  // A move already pending to this same lane is the same write. The entry lives
+  // until the board echoes the move (or the grace window ends), so the menu and a
+  // drag on one press collapse into one POST and one toast; dropping the repeat
+  // keeps the first write authoritative.
   const pending = $sessionStatus.get()[sessionId]
 
   if (pending && pending.status === lane) return
@@ -1403,6 +1414,43 @@ function writeSessionLane(projectId, sessionId, status) {
         message: `Could not move this session to ${laneLabel(lane, $lanes.get())}: ${(err && err.message) || 'the board did not answer'}`
       })
     })
+}
+
+// One move, one fold and one drop, for both kanbans. The Status board and the
+// project panel used to carry a copy each; the rule a drop depends on (a card
+// dropped on a folded rail unfolds it first, so the move never disappears into
+// a strip) is the part that must not drift. Each page keeps only its own drag
+// state, which is the one real difference between them.
+function laneActions(byLane, collapsed) {
+  const move = (card, status) => {
+    if (!card || !status || card.lane === status) return
+    writeSessionLane(card.projectId, card.sessionId, status)
+  }
+
+  // A click folds or unfolds one column and remembers that choice, so the next
+  // visit keeps it even after the lane fills up or empties again.
+  const toggle = laneId => {
+    if (!laneId) return
+    const next = { ...collapsed }
+    const hasCards = (byLane.get(laneId) || []).length > 0
+
+    next[laneId] = !laneCollapsed(laneId, collapsed, hasCards)
+    $collapsed.set(next)
+    writeCollapsed(next)
+  }
+
+  const drop = (card, laneId) => {
+    if (!card || !laneId) return
+    if (laneCollapsed(laneId, collapsed, true)) {
+      const next = { ...collapsed, [laneId]: false }
+
+      $collapsed.set(next)
+      writeCollapsed(next)
+    }
+    move(card, laneId)
+  }
+
+  return { drop, move, toggle }
 }
 
 // The board wins once it echoes the move, or after the grace window; without this
@@ -1474,6 +1522,17 @@ function boardFailureText(payload) {
   return String((payload && (payload.error || payload.message)) || 'the board did not answer').trim()
 }
 
+// A failed `projects.project_sessions` read is not an empty project: the tree
+// still knows the count, so "No sessions in this project yet" would contradict
+// the header. The sentence names the read's own reason and says the poll retries.
+function projectSessionsFailureText(err) {
+  const reason = String((err && (err.message || err.error)) || 'the request failed')
+    .trim()
+    .replace(/\.+$/, '')
+
+  return `Could not load this project's sessions: ${reason}. Retrying on the next refresh.`
+}
+
 function useBoard() {
   const query = useQuery({
     queryFn: () => boardRest('/board'),
@@ -1493,6 +1552,15 @@ function useBoard() {
   )
   const data = statuses ? liveData : null
   const links = useMemo(() => (data && Array.isArray(data.links) ? data.links : []), [data])
+
+  // A posted move lives until the board echoes it, and this read is where the
+  // echo arrives on every page. Reconciling here (not in the Status view) is what
+  // lets the project page and the Projects view clear the pending lane too: the
+  // page then stops showing a lane the store has already left, and re-picking
+  // that shown lane is no longer dropped as a repeat.
+  useEffect(() => {
+    reconcileSessionLanes(links)
+  }, [links])
 
   useEffect(() => {
     $boardLive.set(Boolean(data))
@@ -1775,12 +1843,38 @@ function useProjectRefs(projects, links) {
 // a failed post retries when the board comes back ($boardLive flips or the tree
 // changes).
 let projectSyncSig = ''
+// The last sync failure already reported: the debounce fires again on every
+// board tick, and the same sentence twice is noise, not information.
+let projectSyncError = ''
 
 function projectSyncRows(projects) {
   return (projects || [])
     .filter(p => p && p.id)
     .map(p => ({ id: String(p.id), label: String(p.label || ''), paths: folderList(p) }))
     .sort((a, b) => a.id.localeCompare(b.id))
+}
+
+// The one POST that registers this profile's projects. A failure is said out
+// loud: swallowed, it resurfaced much later as a raw project id in a move
+// refusal, with nothing pointing back at the sync that never landed.
+function syncProjects(rows, sig) {
+  return boardRest('/board/projects', { method: 'POST', body: { projects: rows } })
+    .then(() => {
+      projectSyncSig = sig
+      projectSyncError = ''
+    })
+    .catch(err => {
+      const reason = String((err && err.message) || 'the board did not answer')
+        .trim()
+        .replace(/\.+$/, '')
+
+      if (projectSyncError === reason) return
+      projectSyncError = reason
+      host.notify({
+        kind: 'warning',
+        message: `Could not register this project with the board: ${reason}.`
+      })
+    })
 }
 
 function useProjectSync(projects) {
@@ -1792,11 +1886,7 @@ function useProjectSync(projects) {
     if (rows.length === 0 || projectSyncSig === sig) return undefined
 
     const timer = schedule(() => {
-      boardRest('/board/projects', { method: 'POST', body: { projects: rows } })
-        .then(() => {
-          projectSyncSig = sig
-        })
-        .catch(() => {})
+      syncProjects(rows, sig)
     }, BOARD_SYNC_DEBOUNCE_MS)
 
     return () => {
@@ -2229,15 +2319,6 @@ const S = {
   viewBody: { display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' },
   viewBar: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 20px 10px', flex: 'none', flexWrap: 'wrap' },
   viewSwitch: { display: 'inline-flex', flex: 'none' },
-  groupList: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 8,
-    padding: '0 20px 16px',
-    overflow: 'auto',
-    flex: '1 1 0',
-    minHeight: 0
-  },
   panelBoard: { display: 'flex', flex: '1 1 0', minHeight: 240, maxHeight: 520, minWidth: 0 },
   titleRow: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
   titleIcon: { color: 'var(--ui-text-secondary)', flex: 'none' },
@@ -4851,10 +4932,6 @@ function ghStatusKey(kind, row) {
   if (state === 'open') return 'open'
 
   return 'unknown'
-}
-
-function ghStatusColor(kind, row) {
-  return GH_STATUS_COLORS[ghStatusKey(kind, row)]
 }
 
 function ghStatusLabel(kind, row) {
@@ -8989,6 +9066,10 @@ function ProjectDetailPage() {
 
   const live = useLiveSessions()
   const project = (detail.data && detail.data.project) || node
+  // A settled failed read is not an empty project: the tree still supplies the
+  // session count in the header, so the empty state must say the read failed
+  // rather than claim there are no sessions.
+  const detailFailure = detail.isError && !detail.data ? projectSessionsFailureText(detail.error) : ''
   // Mounting the same /board read here keeps the header's status picker on the
   // server copy even when the detail page is opened first (a tab or deep link),
   // and the project sync keeps the backend's cwd index fresh either way. The
@@ -9073,35 +9154,16 @@ function ProjectDetailPage() {
 
     return map
   }, [panelCards, laneRows])
-  const panelMove = (card, status) => {
-    if (!card || !status || card.lane === status) return
-    writeSessionLane(card.projectId, card.sessionId, status)
-  }
-  // A rail click folds or unfolds one lane, exactly as the Status board's does.
-  const panelToggleLane = laneId => {
-    if (!laneId) return
-    const next = { ...collapsedLanes }
-    const hasCards = (panelByLane.get(laneId) || []).length > 0
+  // The same move, fold and drop the Status board runs, from the shared
+  // `laneActions`: only the drag state that feeds them is this page's own.
+  const { drop: dropCard, move: panelMove, toggle: panelToggleLane } = laneActions(panelByLane, collapsedLanes)
 
-    next[laneId] = !laneCollapsed(laneId, collapsedLanes, hasCards)
-    $collapsed.set(next)
-    writeCollapsed(next)
-  }
   const panelDrop = laneId => {
     const card = panelDrag
 
     setPanelDrag(null)
     setPanelDropLane('')
-    if (!card || !laneId) return
-    // Same rule as the Status board: a card dropped on a folded rail unfolds the
-    // lane first, so the move never disappears into a strip.
-    if (laneCollapsed(laneId, collapsedLanes, true)) {
-      const next = { ...collapsedLanes, [laneId]: false }
-
-      $collapsed.set(next)
-      writeCollapsed(next)
-    }
-    panelMove(card, laneId)
+    dropCard(card, laneId)
   }
 
   // The header names the work tree a vault subfolder really belongs to. Same
@@ -9186,6 +9248,15 @@ function ProjectDetailPage() {
             children: [jsx(Skeleton, { style: { height: 28, width: '40%' } }), jsx(Skeleton, { style: { height: 64 } }), jsx(Skeleton, { style: { height: 120 } })]
           })
         ]
+      })
+    }
+
+    // A failed tree read is not a missing project: "gone" would blame the
+    // project for the read. Say what actually happened instead.
+    if (tree.isError && !tree.data) {
+      return jsx(DetailEmpty, {
+        description: "Could not read the project tree, so this project can't be shown right now.",
+        title: 'Could not load this project'
       })
     }
 
@@ -9350,7 +9421,10 @@ function ProjectDetailPage() {
                     })
                   })
                 : lanes.length === 0
-                ? jsx('div', { style: S.quiet, children: detail.isLoading ? 'Loading sessions...' : 'No sessions in this project yet' })
+                ? jsx('div', {
+                    style: S.quiet,
+                    children: detail.isLoading ? 'Loading sessions...' : detailFailure || 'No sessions in this project yet'
+                  })
                 : lanes.map(group => {
                     const branch =
                       group.lane.isGit === false
@@ -10830,12 +10904,6 @@ function useSessionCards(lanes) {
   const boardState = useBoard()
   const live = useLiveSessions()
 
-  // A move this client posted is dropped as soon as the board echoes it, so a
-  // card never sits on a lane the store already disagrees with.
-  useEffect(() => {
-    reconcileSessionLanes(boardState.links)
-  }, [boardState.links])
-
   const treeProjects = useMemo(() => (tree.data && tree.data.projects) || [], [tree.data])
   const boardProjects = useMemo(
     () => (boardState.data && Array.isArray(boardState.data.projects) ? boardState.data.projects : []),
@@ -10944,39 +11012,16 @@ function SessionsKanbanPage() {
 
   // Every refusal is writeSessionLane's to explain, so this never returns quietly
   // on a card the move cannot name: it hands the empty id over and the toast says
-  // which one is missing.
-  const move = (card, status) => {
-    if (!card || !status || card.lane === status) return
-    writeSessionLane(card.projectId, card.sessionId, status)
-  }
-
-  // A click folds or unfolds one column and remembers that choice, so the next
-  // visit keeps it even after the lane fills up or empties again.
-  const toggleLane = laneId => {
-    if (!laneId) return
-    const next = { ...collapsedLanes }
-    const hasCards = (byLane.get(laneId) || []).length > 0
-
-    next[laneId] = !laneCollapsed(laneId, collapsedLanes, hasCards)
-    $collapsed.set(next)
-    writeCollapsed(next)
-  }
+  // which one is missing. The three handlers are the shared ones the project
+  // panel mounts, so the fold rule cannot differ between the two boards.
+  const { drop: dropCard, move, toggle: toggleLane } = laneActions(byLane, collapsedLanes)
 
   const drop = laneId => {
     const card = dragCard
 
     setDragCard(null)
     setDropLane('')
-    if (!card || !laneId) return
-    // A card dropped on a folded rail lands in a lane you can see: unfold it
-    // first, so the move is not silent into a 40px strip.
-    if (laneCollapsed(laneId, collapsedLanes, true)) {
-      const next = { ...collapsedLanes, [laneId]: false }
-
-      $collapsed.set(next)
-      writeCollapsed(next)
-    }
-    move(card, laneId)
+    dropCard(card, laneId)
   }
 
   const refresh = () => {
@@ -11240,7 +11285,7 @@ function focusedProjectId(sessionId) {
     boardRest('/board').catch(() => null),
     host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT, ...profileParam() }).catch(() => null)
   ]).then(([board, tree]) => {
-    const linked = linkProjectForSession(board && board.links, sessionId)
+    const linked = board ? linkProjectForSession(board.links, sessionId) : ''
 
     if (linked) return linked
 
@@ -11252,20 +11297,33 @@ function focusedProjectId(sessionId) {
 
     if (claimed && claimed.id) return String(claimed.id)
 
-    return projectForPath(projectFoldersOf(projects), focusedCwd())
+    const byPath = tree ? projectForPath(projectFoldersOf(projects), focusedCwd()) : ''
+
+    if (byPath) return byPath
+    // "No project" is an answer only when both reads answered: a failed read
+    // reaching the caller as '' is what made the click say the session has no
+    // project when the board was simply unreachable.
+    if (!board || !tree) {
+      const failure = new Error('a board read did not answer')
+
+      failure.code = 'read_failed'
+      throw failure
+    }
+
+    return ''
   })
 }
 
-// The titlebar click. It opens the focused session's project page, or says why
+// The titlebar click. It opens the focused session's project, or says why
 // there is none and shows the board: the session tab leaves the route already
-// here, so a `to` on the tool would be a no-op. The two "none" cases are
-// different sentences: no focused session is not a session without a project.
+// here, so a `to` on the tool would be a no-op. The three "nothing opened"
+// cases are different sentences: no focused session, a session without a
+// project, and a read that failed (which is not the session's fault).
 function openFocusedSessionProject() {
   const sessionId = focusedSessionId()
 
-  return focusedProjectId(sessionId)
-    .catch(() => '')
-    .then(projectId => {
+  return focusedProjectId(sessionId).then(
+    projectId => {
       if (projectId) {
         openProject(projectId)
 
@@ -11279,7 +11337,15 @@ function openFocusedSessionProject() {
           ? 'This session is not in a project yet, so the board opened instead.'
           : 'No session is focused yet, so the board opened instead.'
       })
-    })
+    },
+    () => {
+      openView('projects')
+      host.notify({
+        kind: 'error',
+        message: "Could not reach the board to find this session's project, so the board opened instead."
+      })
+    }
+  )
 }
 
 function titlebarTool() {

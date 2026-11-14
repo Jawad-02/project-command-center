@@ -249,3 +249,19 @@ test('a custom project lane is left out of its own header and named by its label
   assert.equal(L.sessionLaneSummary(3, { active: 2, review: 1 }, 'active', lanes), `3 sessions ${dot} 1 review`)
   assert.equal(L.sessionLaneSummary(3, { active: 2, review: 1 }, 'active'), `3 sessions ${dot} 1 review`)
 })
+
+// A system lane keeps its id when it is renamed, so the seeded word is no longer
+// the lane's name: the summary has to read the label the table carries now.
+test('a renamed system lane prints the label it carries now', () => {
+  const lanes = [
+    { id: 'active', label: 'Active', order: 1 },
+    { id: 'review', label: 'QA check', order: 2 }
+  ]
+
+  assert.equal(
+    L.sessionLaneSummary(2, { active: 0, review: 2 }, 'active', lanes),
+    '2 sessions \u00b7 2 qa check'
+  )
+  // No table, no label: the id is the only honest word left.
+  assert.equal(L.sessionLaneSummary(2, { review: 2 }, 'active'), '2 sessions \u00b7 2 review')
+})

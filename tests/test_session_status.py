@@ -349,6 +349,53 @@ def main() -> int:
           (board_reply.get("project") or {}).get("link", {}).get("status") == "active",
           str((board_reply.get("project") or {}).get("link")))
 
+    # --- store: a lane deleted between the check and the write --------------
+    # `set_status` validates the lane in a read of its own and only then opens the
+    # write transaction, so a concurrent `delete_lane` can land in between. The
+    # second look inside the transaction is what refuses the dead lane instead of
+    # storing it and answering ok.
+    section("store / a lane deleted between the check and the write is refused")
+    store.set_link("s-race", "pcc")
+    project_lane = store.save_lane(label="QA check").get("lane")
+    session_lane = store.save_lane(label="QA check two").get("lane")
+    check("both race lanes exist", bool(project_lane) and bool(session_lane),
+          f"{project_lane!r} {session_lane!r}")
+    plain_refusal = store._lane_refusal
+
+    def racing_refusal(state):
+        lane_id, refusal = plain_refusal(state)
+        if refusal is None and lane_id in (project_lane, session_lane):
+            # Another process deletes the lane right after this read returned.
+            store.delete_lane(lane_id)
+        return lane_id, refusal
+
+    store._lane_refusal = racing_refusal
+    try:
+        before_project = (store.get_status("pcc") or {}).get("status")
+        raced_project = store.set_status("pcc", project_lane, "raced", "user")
+        raced_session = store.set_status("pcc", session_lane, "raced", "user", session_id="s-race")
+    finally:
+        store._lane_refusal = plain_refusal
+
+    print(f"  project write: {json.dumps(raced_project, default=str)}")
+    print(f"  session write: {json.dumps(raced_session, default=str)}")
+    for name, reply in (("project", raced_project), ("session", raced_session)):
+        check(f"a {name} write to a lane deleted before the transaction is refused",
+              reply.get("ok") is False and reply.get("code") == "bad_status",
+              str(reply.get("code")))
+        check(f"the {name} refusal says the lane was just removed",
+              reply.get("error") == "That lane was just removed; pick another lane.",
+              str(reply.get("error")))
+    check("the project lane is untouched by the refused write",
+          (store.get_status("pcc") or {}).get("status") == before_project,
+          str((store.get_status("pcc") or {}).get("status")))
+    check("the session row keeps no lane from the refused write",
+          (store.get_link("s-race") or {}).get("status") is None,
+          str(store.get_link("s-race")))
+    check("neither dead lane is back in the table",
+          project_lane not in store.lane_ids() and session_lane not in store.lane_ids(),
+          str(store.lane_ids()))
+
     # --- hooks: pre_llm_call ------------------------------------------------
     section("hook / pre_llm_call names the session's lane")
     store.set_status("pcc", "active", "project note", "user")

@@ -114,7 +114,88 @@ test('B: a failed project read says so instead of reporting an empty project', (
   const page = fn('ProjectDetailPage')
 
   assert.match(page, /const detailFailure = detail\.isError && !detail\.data \? projectSessionsFailureText\(detail\.error\) : ''/)
-  assert.match(page, /detailFailure \|\| 'No sessions in this project yet'/, 'the empty state only says "no sessions" when the read answered')
+  assert.match(page, /const panelBody = projectPanelBody\(/, 'the panel takes its body from the one decision')
+})
+
+// A `projects.tree` entry as `build_tree(hydrate=False)` really shapes it: the
+// project keeps its repo and branch groups, with every session list empty. That
+// is the payload the old panel read as "one lane, no sessions".
+const TREE_PROJECT = {
+  id: 'p1',
+  label: 'Alpha',
+  path: '/alpha',
+  sessionCount: 2,
+  repos: [
+    { id: 'main', label: 'alpha', path: '/alpha', groups: [{ id: 'main', label: 'main', isGit: true, sessions: [] }] }
+  ]
+}
+
+// The panel decision as the page runs it: the sliced block, not a copy, with the
+// one dependency `laneGroups` sorts by stubbed (every list here is empty, so the
+// sort cannot change the result).
+function panel() {
+  const block = slice('// project-panel:begin', '// project-panel:end')
+  const context = vm.createContext({ sessionStamp: () => 0 })
+
+  vm.runInContext(
+    `${fn('laneGroups')}\n${block}\n;globalThis.__panel = { laneGroups, projectPanelBody }`,
+    context,
+    { filename: PLUGIN }
+  )
+
+  return context.__panel
+}
+
+test('B: a failed read outranks the tree-shaped lane, in both view modes', () => {
+  const { laneGroups, projectPanelBody } = panel()
+  const lanes = laneGroups(TREE_PROJECT)
+  const failure = "Could not load this project's sessions: REST 502: the gateway did not answer. Retrying on the next refresh."
+
+  assert.equal(lanes.length, 1, 'the tree hands the panel one branch')
+  assert.equal(lanes[0].sessions.length, 0, 'with its session list empty')
+
+  for (const panelMode of ['branch', 'lane']) {
+    const body = projectPanelBody({ detailFailure: failure, isLoading: false, lanes, panelMode })
+
+    assert.equal(body.kind, 'notice', `${panelMode}: a failed read is a notice, not a branch or a board`)
+    assert.equal(body.text, failure, `${panelMode}: the failure sentence wins over the empty lane`)
+  }
+
+  // And the call site one level up honours the notice before either view mounts,
+  // so the decision cannot be right while the page still renders the lane.
+  const page = fn('ProjectDetailPage')
+  const notice = page.indexOf("panelBody.kind === 'notice'")
+  const kanban = page.indexOf('jsx(KanbanViews')
+
+  assert.ok(notice >= 0, 'the panel renders the notice branch')
+  assert.ok(kanban > notice, 'the notice is checked before the lane board is mounted')
+})
+
+test('B: first load says it is loading, and an empty answer still says the project is empty', () => {
+  const { laneGroups, projectPanelBody } = panel()
+  const empty = laneGroups({ id: 'p2', label: 'Empty', repos: [] })
+  const lanes = laneGroups(TREE_PROJECT)
+
+  // The helper runs inside the vm realm, so compare its fields, not its
+  // prototype.
+  const body = args => ({ ...projectPanelBody(args) })
+
+  assert.deepEqual(body({ detailFailure: '', isLoading: false, lanes: empty, panelMode: 'branch' }), {
+    kind: 'notice',
+    text: 'No sessions in this project yet'
+  })
+  assert.deepEqual(body({ detailFailure: '', isLoading: true, lanes, panelMode: 'branch' }), {
+    kind: 'notice',
+    text: 'Loading sessions...'
+  })
+  assert.deepEqual(body({ detailFailure: '', isLoading: false, lanes, panelMode: 'branch' }), {
+    kind: 'branch',
+    text: ''
+  })
+  assert.deepEqual(body({ detailFailure: '', isLoading: false, lanes, panelMode: 'lane' }), {
+    kind: 'lane',
+    text: ''
+  })
 })
 
 // ── C: a failed tree read is not a missing project ───────────────────────────
@@ -133,10 +214,10 @@ test('C: a failed tree read says the tree could not be read, not that the projec
 
 // ── D: the titlebar reports a failed read as a failed read ──────────────────
 function titlebar() {
-  const state = { board: null, tree: null, opened: [], viewed: [], notified: [] }
+  const state = { board: null, tree: null, opened: [], viewed: [], notified: [], boardAnswer: { links: [] } }
   const context = vm.createContext({
     TREE_PREVIEW_LIMIT: 500,
-    boardRest: () => (state.board ? Promise.resolve({ links: [] }) : Promise.reject(new Error('REST 503'))),
+    boardRest: () => (state.board ? Promise.resolve(state.boardAnswer) : Promise.reject(new Error('REST 503'))),
     host: {
       state: {
         focusedStoredSessionId: { get: () => 's1' },
@@ -190,6 +271,31 @@ test('D: a read that answered "no project" keeps the project-less sentence', asy
   )
 })
 
+test('D: a board that answered ok:false is a failed read, not a project-less session', async () => {
+  const { context, state } = titlebar()
+
+  state.board = true
+  state.tree = true
+  // The store failure shape: HTTP 200, ok:false, and links empty. Truthy, so the
+  // old check called it an answer and the click blamed the session.
+  state.boardAnswer = {
+    ok: false,
+    code: 'store_error',
+    error: 'the board database could not be reached: OperationalError',
+    links: [],
+    statuses: []
+  }
+
+  await context.__open()
+
+  assert.deepEqual(state.opened, [])
+  assert.deepEqual(state.viewed, ['projects'], 'the board still opens')
+  assert.deepEqual(
+    state.notified.map(message => `${message.kind}:${message.message}`),
+    ["error:Could not reach the board to find this session's project, so the board opened instead."]
+  )
+})
+
 // ── F: a project lane pick that names a dead lane is refused out loud ───────
 test('F: picking a lane the board no longer has says so instead of returning', () => {
   const state = { notices: [], posts: [] }
@@ -218,14 +324,14 @@ test('F: picking a lane the board no longer has says so instead of returning', (
 
 // ── G: a failed project sync is reported, once per distinct reason ──────────
 function sync() {
-  const state = { notices: [], posts: 0, fail: null }
+  const state = { notices: [], posts: 0, fail: null, answer: { ok: true } }
   const context = vm.createContext({
     projectSyncSig: '',
     projectSyncError: '',
     boardRest: () => {
       state.posts += 1
 
-      return state.fail ? Promise.reject(state.fail) : Promise.resolve({ ok: true })
+      return state.fail ? Promise.reject(state.fail) : Promise.resolve(state.answer)
     },
     host: { notify: message => state.notices.push(message) }
   })
@@ -254,6 +360,33 @@ test('G: a failed project sync says why, and does not repeat itself', async () =
   await context.__sync([{ id: 'p1', label: 'Alpha', paths: ['/alpha'] }], 'sig-1')
   assert.equal(context.projectSyncSig, 'sig-1', 'a sync that landed is remembered')
   assert.equal(state.notices.length, 1)
+})
+
+test('G: an HTTP 200 that says ok:false is a failed sync, so it says so and retries', async () => {
+  const { context, state } = sync()
+  const rows = [{ id: 'p1', label: 'Alpha', paths: ['/alpha'] }]
+
+  // The route answers 200 with the store's own refusal, which used to be read
+  // as a landed sync: recorded, silent, and never retried until the tree moved.
+  state.answer = {
+    ok: false,
+    code: 'store_error',
+    error: 'the board database could not be reached: OperationalError'
+  }
+  await context.__sync(rows, 'sig-1')
+
+  assert.equal(context.projectSyncSig, '', 'a refused sync is not recorded as done')
+  assert.deepEqual(
+    state.notices.map(message => `${message.kind}:${message.message}`),
+    ['warning:Could not register this project with the board: the board database could not be reached: OperationalError.']
+  )
+
+  await context.__sync(rows, 'sig-1')
+  assert.equal(state.posts, 2, 'the next board tick retries, instead of waiting for the tree to change')
+
+  state.answer = { ok: true }
+  await context.__sync(rows, 'sig-1')
+  assert.equal(context.projectSyncSig, 'sig-1', 'an ok answer is the one that is remembered')
 })
 
 // ── H1: StartSessionButton forwards `kind` to openIssueDraft ────────────────

@@ -439,7 +439,7 @@ test('the project page session panel offers By branch and By lane', () => {
   const block = source.slice(begin, begin + 2600)
 
   assert.match(block, /SegmentedControl, \{ onChange: setPanelMode, options: PANEL_MODES/, 'the toggle is in the panel header')
-  assert.match(block, /panelMode === 'lane'/, 'the panel branches on the mode')
+  assert.match(block, /panelBody\.kind === 'lane'/, 'the panel branches on the body decision')
   assert.match(block, /jsx\(KanbanViews, \{/, 'the lane mode renders the kanban')
   assert.match(block, /lanes: laneRows/, 'the columns are the server lane table')
   assert.match(block, /onMove: panelMove/, 'a move in the panel is a real move')

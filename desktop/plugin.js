@@ -1859,7 +1859,16 @@ function projectSyncRows(projects) {
 // refusal, with nothing pointing back at the sync that never landed.
 function syncProjects(rows, sig) {
   return boardRest('/board/projects', { method: 'POST', body: { projects: rows } })
-    .then(() => {
+    .then(res => {
+      // The route answers HTTP 200 with `ok: false` when the store throws, so a
+      // resolved promise is not a landed sync: recorded as done, the board kept
+      // an unregistered project until the tree happened to change again.
+      if (!res || res.ok === false) {
+        throw new Error(
+          (res && typeof res.error === 'string' && res.error.trim()) || 'the board refused the project sync'
+        )
+      }
+
       projectSyncSig = sig
       projectSyncError = ''
     })
@@ -8967,6 +8976,23 @@ function laneGroups(node) {
   return out
 }
 
+// project-panel:begin
+// One decision for the sessions panel, and the order IS the promise: a failed
+// read is said out loud before either view mode is chosen, a first load says it
+// is loading, and only a read that answered can claim the project is empty.
+// A settled failure used to fall through to the tree's branch groups, whose
+// session lists are empty, so the panel printed "No sessions on this lane" over
+// a broken read; in the By-lane mode it printed nothing at all.
+function projectPanelBody({ detailFailure, isLoading, lanes, panelMode }) {
+  if (detailFailure) return { kind: 'notice', text: detailFailure }
+  if (isLoading) return { kind: 'notice', text: 'Loading sessions...' }
+  if (panelMode === 'lane') return { kind: 'lane', text: '' }
+  if (!lanes || lanes.length === 0) return { kind: 'notice', text: 'No sessions in this project yet' }
+
+  return { kind: 'branch', text: '' }
+}
+// project-panel:end
+
 function DetailSessionRow({ session, state, onOpen, lane, lanes, projectLabel, goal }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
@@ -9178,6 +9204,15 @@ function ProjectDetailPage() {
   })
 
   const loadedCount = useMemo(() => lanes.reduce((n, l) => n + l.sessions.length, 0), [lanes])
+  // What the panel shows, decided in one place: the failed read and the first
+  // load outrank the view mode, so neither a tree-shaped lane list nor an empty
+  // kanban can stand in for an answer the page never got.
+  const panelBody = projectPanelBody({
+    detailFailure,
+    isLoading: Boolean(detail.isLoading),
+    lanes,
+    panelMode
+  })
   const liveCount = useMemo(() => {
     let n = 0
 
@@ -9393,7 +9428,9 @@ function ProjectDetailPage() {
                   jsx('span', { style: S.count, children: loadedCount })
                 ]
               }),
-              panelMode === 'lane'
+              panelBody.kind === 'notice'
+                ? jsx('div', { style: S.quiet, children: panelBody.text })
+                : panelBody.kind === 'lane'
                 ? jsx('div', {
                     style: S.panelBoard,
                     children: jsx(KanbanViews, {
@@ -9419,11 +9456,6 @@ function ProjectDetailPage() {
                       states: live.byStored,
                       view: 'kanban'
                     })
-                  })
-                : lanes.length === 0
-                ? jsx('div', {
-                    style: S.quiet,
-                    children: detail.isLoading ? 'Loading sessions...' : detailFailure || 'No sessions in this project yet'
                   })
                 : lanes.map(group => {
                     const branch =
@@ -11285,7 +11317,11 @@ function focusedProjectId(sessionId) {
     boardRest('/board').catch(() => null),
     host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT, ...profileParam() }).catch(() => null)
   ]).then(([board, tree]) => {
-    const linked = board ? linkProjectForSession(board.links, sessionId) : ''
+    // `/board` answers `ok: false` with empty `links` when the store throws, so a
+    // truthy payload is not a read that answered: treating it as one made the
+    // titlebar claim the session has no project while the board was down.
+    const boardFailed = !board || board.ok === false
+    const linked = boardFailed ? '' : linkProjectForSession(board.links, sessionId)
 
     if (linked) return linked
 
@@ -11303,7 +11339,7 @@ function focusedProjectId(sessionId) {
     // "No project" is an answer only when both reads answered: a failed read
     // reaching the caller as '' is what made the click say the session has no
     // project when the board was simply unreachable.
-    if (!board || !tree) {
+    if (boardFailed || !tree) {
       const failure = new Error('a board read did not answer')
 
       failure.code = 'read_failed'

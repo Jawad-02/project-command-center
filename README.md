@@ -73,6 +73,10 @@ Each branch row gives you a session, not a chore. Start one in a worktree, or ch
 
 ![Every issue row is a session door](./docs/screenshots/issues.png)
 
+A running session wears the app's travelling ring on its card, and while you drag one the lane under the cursor says "Release to drop in <lane>" before you let go.
+
+Archived sessions are not silent: the bottom of the board tells you how many are hidden, and one click brings the newest 300 back into their lanes and project columns, each marked `Archived`. That count is why a board can look emptier than your session list: the gateway never returns archived rows, so the plugin reads them from its own state database.
+
 Sessions carry a lane: unfiled, backlog, active, review, blocked, done or canceled. A merged PR or a completed issue lands in done, a closed one in canceled, and a session nothing claims sits in unfiled. The board summarises them per project, so "who is on review" is a glance instead of a hunt.
 
 ## What it never does

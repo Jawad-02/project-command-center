@@ -62,7 +62,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'inline-gh-comments.2026-11-15T0330Z'
+const PLUGIN_BUILD = 'board-live-archived.2026-11-15T0530Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -77,6 +77,10 @@ const STATUS_KEY = 'projectStatus.v1'
 const LANES_KEY = 'sessionLanes.v1'
 // Explicit column collapse choices; the default and the empty rule live in code.
 const COLLAPSE_KEY = 'kanbanCollapsed.v1'
+const ARCHIVED_KEY = 'kanbanShowArchived.v1'
+// The backend's own cap (`ARCHIVED_MAX` in dashboard/plugin_api.py). Asking for more
+// is a 422, so the two numbers have to move together.
+const ARCHIVED_LIMIT = 300
 // Lanes that start folded: the two a working session is never in.
 const KANBAN_COLLAPSED_DEFAULT = ['unfiled', 'backlog']
 const SORT_KEY = 'projectSort.v1'
@@ -1130,6 +1134,7 @@ function restoreStoredState() {
   $ghPreset.set(readGhPreset())
   $openProject.set(readOpenProject())
   $collapsed.set(readCollapsed())
+  $showArchived.set(readShowArchived())
 }
 
 function writeCollapsed(next) {
@@ -1137,6 +1142,34 @@ function writeCollapsed(next) {
 }
 
 const $collapsed = atom(readCollapsed())
+
+// The archived filter is GLOBAL on purpose: one switch for the whole board, because
+// an archived session is absent from `session.list` on every surface at once. It
+// starts off (the board is about what is moving), and the count at the bottom of the
+// board is the only control, so nobody has to hunt a second checkbox with the same
+// meaning.
+function readShowArchived() {
+  try {
+    return Boolean(pluginCtx && pluginCtx.storage ? pluginCtx.storage.get(ARCHIVED_KEY, false) : false)
+  } catch {
+    return false
+  }
+}
+
+function writeShowArchived(next) {
+  if (!pluginDisposed && pluginCtx) pluginCtx.storage.set(ARCHIVED_KEY, Boolean(next))
+}
+
+const $showArchived = atom(readShowArchived())
+
+// The board's archived filter, written from either view's footer so the two cannot
+// disagree about what is on screen.
+function setArchivedFilter(value) {
+  const next = Boolean(value)
+
+  writeShowArchived(next)
+  $showArchived.set(next)
+}
 
 function laneCollapsed(id, explicit, hasCards) {
   const chosen = explicit ? explicit[id] : undefined
@@ -2307,7 +2340,9 @@ const CSS_TEXT = `
 .pcc-kcard { transition: background-color 120ms ease, border-color 120ms ease, opacity 120ms ease; }
 .pcc-kcard:hover, .pcc-kcard:focus-visible { background: var(--chrome-action-hover); border-color: var(--ui-stroke-secondary); outline: none; }
 .pcc-kcard[data-dragging="true"] { opacity: 0.5; }
+.pcc-kcol:not(.pcc-krail) { border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); background: color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent); transition: border-color 120ms ease, background-color 120ms ease; }
 .pcc-kcol[data-drop="true"] { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 6%, transparent); }
+@media (prefers-reduced-motion: reduce) { .pcc-kcol:not(.pcc-krail) { transition: none !important; } }
 .pcc-krail { border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); background: color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent); transition: background-color 120ms ease, border-color 120ms ease; }
 .pcc-krail:hover { background: color-mix(in srgb, var(--chrome-action-hover) 80%, transparent); border-color: var(--ui-stroke-secondary); }
 .pcc-krail:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -2px; }
@@ -2359,6 +2394,59 @@ const S = {
     border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
     background: 'color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent)',
     overflow: 'hidden'
+  },
+  // The kanban column's LAYOUT only. Paint lives in the `.pcc-kcol` rules, because an
+  // inline background outranks `.pcc-kcol[data-drop="true"]`: that is how the drop
+  // target stayed invisible while the folded rail beside it lit up correctly.
+  kcol: {
+    position: 'relative',
+    display: 'flex',
+    flexDirection: 'column',
+    width: COLUMN_WIDTH,
+    flex: `0 0 ${COLUMN_WIDTH}px`,
+    minHeight: 0,
+    borderRadius: 12,
+    overflow: 'hidden'
+  },
+  // The archived count, at the bottom of the board. Dashed and quiet when the filter
+  // is off (it is a footnote, not a feature), solid and orange when archived sessions
+  // are on screen (it is then the answer to "where did these come from").
+  archivedBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flex: 'none',
+    width: 'fit-content',
+    margin: '0 20px 10px',
+    padding: '6px 10px',
+    borderRadius: 8,
+    border: '1px dashed color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
+    background: 'transparent',
+    color: 'var(--ui-text-quaternary)',
+    font: 'inherit',
+    fontSize: '0.6875rem',
+    textAlign: 'left',
+    cursor: 'pointer'
+  },
+  archivedBarOn: {
+    borderStyle: 'solid',
+    borderColor: 'color-mix(in srgb, var(--ui-orange) 55%, transparent)',
+    color: 'var(--ui-text-secondary)'
+  },
+  archivedBarLabel: { fontWeight: 500, color: 'inherit' },
+  // "If you release now it drops here", in words, while the lane is hovered.
+  kdropHint: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    flex: 'none',
+    margin: '0 10px 8px',
+    padding: '6px 8px',
+    borderRadius: 8,
+    border: '1px dashed var(--ui-accent)',
+    color: 'var(--ui-accent)',
+    fontSize: '0.6875rem',
+    fontWeight: 500
   },
   colHeader: {
     position: 'sticky',
@@ -3461,6 +3549,11 @@ const S = {
     borderRadius: '0 0 12px 12px'
   },
   kcard: {
+    // Host for the app's own running-session ring: `.arc-border` is absolutely
+    // positioned and reads `--arc-radius`, so the card has to be the positioning
+    // context and declare the same radius the card draws.
+    position: 'relative',
+    '--arc-radius': '8px',
     display: 'flex',
     flexDirection: 'column',
     gap: 6,
@@ -3856,6 +3949,9 @@ function SessionCard({ session, state, showProject, onOpen, lane, goal }) {
         children: [
           // The goal leads the meta line: it is the one item that will not survive an overflow.
           goal ? jsx(GoalMeta, { goal }, 'goal') : null,
+          session.archived
+            ? jsx('span', { style: { ...S.chip, color: 'var(--ui-orange)' }, children: 'Archived' }, 'archived')
+            : null,
           session.git_branch ? jsx(BranchChip, { branch: session.git_branch }) : null,
           showProject ? jsx('span', { style: S.metaItem, children: showProject }) : null,
           ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { style: S.metaItem, children: ageText(ms) }) }) : null,
@@ -10221,11 +10317,52 @@ function ProjectsPage() {
   const sortId = useValue($sort)
   const filtered = useMemo(() => (q ? projects.filter(p => matchesQuery(p, q)) : projects), [projects, q])
   const visible = useMemo(() => sortProjects(filtered, sortId, statuses), [filtered, sortId, statuses])
+  // The archived filter is board-wide, so this view honours it too: an archived
+  // session joins the column of the project that owns it (its link row first, then
+  // its own cwd), and says "Archived" on its row. Without this the switch would be
+  // global in name and half-applied in fact.
+  const showArchived = useValue($showArchived)
+  const archivedState = useArchivedSessions()
+  const archivedFolders = useMemo(() => projectFoldersOf(projects), [projects])
+  const archivedByProject = useMemo(() => {
+    const map = new Map()
+
+    if (!showArchived) return map
+    for (const row of archivedState.rows) {
+      if (!row || !row.id) continue
+      const link = linkBySession.get(row.id) || null
+      const projectId =
+        String((link && link.project_id) || '') ||
+        (row.cwd ? projectForPath(archivedFolders, row.cwd) : '')
+
+      if (!projectId) continue
+      const marked = { ...row, archived: true }
+      const list = map.get(projectId)
+
+      if (list) list.push(marked)
+      else map.set(projectId, [marked])
+    }
+
+    return map
+  }, [showArchived, archivedState.rows, linkBySession, archivedFolders])
+  // The columns and the "N sessions" line read the SAME list, so a visible archived
+  // row can never be missing from the count that describes the board.
+  const boardVisible = useMemo(() => {
+    if (archivedByProject.size === 0) return visible
+
+    return visible.map(project => {
+      const extra = archivedByProject.get(project.id)
+
+      if (!extra || extra.length === 0) return project
+
+      return { ...project, previewSessions: [...(project.previewSessions || []), ...extra] }
+    })
+  }, [visible, archivedByProject])
   const sessionCounts = useMemo(() => {
     let shown = 0
     let total = 0
 
-    for (const project of visible) {
+    for (const project of boardVisible) {
       for (const session of recentSessions(project)) {
         total += 1
         if (laneFilterAllows(laneFilter, laneForSession(session.id).lane)) shown += 1
@@ -10233,7 +10370,7 @@ function ProjectsPage() {
     }
 
     return { shown, total }
-  }, [visible, laneFilter, laneForSession])
+  }, [boardVisible, laneFilter, laneForSession])
   // One /goals read for the whole page, newest session first: every compact row under every
   // column takes its line from this map, and a project the search hid costs no id at all.
   const goalIds = useMemo(() => {
@@ -10282,8 +10419,8 @@ function ProjectsPage() {
     })
   } else {
     board = jsx(Board, {
-      count: visible.length,
-      children: visible.map((p, i) =>
+      count: boardVisible.length,
+      children: boardVisible.map((p, i) =>
         jsx(
           ProjectColumn,
           {
@@ -10348,6 +10485,7 @@ function ProjectsPage() {
         ]
       }),
       board,
+      jsx(ArchivedFooter, { archived: archivedState, on: showArchived, onToggle: setArchivedFilter }),
       jsx(LiveStrip, {
         items: live.items,
         laneFor: laneForSession,
@@ -10567,6 +10705,10 @@ function buildKanbanCard(input) {
     lastActivity,
     stale: lane.lane !== 'done' && lastActivity > 0 && now - lastActivity > KANBAN_STALE_MS,
     linked: Boolean(link),
+    // An archived session is only on the board while the filter is on, and a card
+    // that looks like every other card while being archived is a trap: the chip says
+    // so. `session.list` never returns these, so nothing else can be mistaken for one.
+    archived: Boolean(source.archived || session.archived),
     // The session's ACTIVE /goal, as the one line the card renders. No goal is null, never a
     // placeholder: a card with no goal must look exactly as it did before this feature.
     goal: goalModel(source.goal)
@@ -10620,7 +10762,11 @@ function kanbanCardsFrom(rows, context) {
       // The link row names the project; without one, the tree's `sessionIds`
       // claim does. Naming that project here is what makes the card's lane
       // writable (the store creates the missing link row on the POST).
-      const projectId = sessionProjectId(session.id, link, join)
+      // An archived row is in no tree and often in no link row, so its own cwd is the
+      // only thing that names a project: the longest folder match answers.
+      const projectId =
+        sessionProjectId(session.id, link, join) ||
+        (session.cwd && Array.isArray(source.folders) ? projectForPath(source.folders, session.cwd) : '')
       const project = projectId ? projectById.get(projectId) || null : null
       const preview = join.previewById.get(String(session.id)) || null
       const folder = project ? primaryPath(project) : ''
@@ -10640,7 +10786,9 @@ function kanbanCardsFrom(rows, context) {
         projectLane: projectId ? statuses[projectId] : '',
         // The preview row knows the session's checkout; the folder's current
         // branch is the fallback. Neither means no chip rather than a fake main.
-        branch: sessionBranch(preview, folder ? branches[folder] : ''),
+        // `preview || session`: an archived row carries its own `git_branch`, and its
+        // row IS its only preview.
+        branch: sessionBranch(preview || session, folder ? branches[folder] : ''),
         // The preview row is the only payload with a last-active stamp.
         lastActivity: sessionStamp(preview || session),
         now,
@@ -11152,6 +11300,10 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
     style: S.kcard,
     tabIndex: 0,
     children: [
+      // The same travelling ring the Projects lane paints on a running session.
+      // It was on every card over there and on none of these, so an active session
+      // read as idle the moment you switched to Status.
+      state && RUNNING.has(state) ? jsx(ArcRing, { radius: '8px' }) : null,
       jsxs('div', {
         style: S.kcardHead,
         children: [
@@ -11167,6 +11319,9 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
           jsx(KanbanProjectTag, { card, onOpenProject }, 'project'),
           card.branch ? jsx(BranchChip, { branch: card.branch, title: `Branch ${card.branch}` }, 'branch') : null,
           jsx(KanbanRefChip, { card }, 'refs'),
+          card.archived
+            ? jsx('span', { style: { ...S.chip, color: 'var(--ui-orange)' }, children: 'Archived' }, 'archived')
+            : null,
           card.linked
             ? null
             : jsx('span', { style: { ...S.chip, color: 'var(--ui-text-quaternary)' }, children: 'Unlinked' }, 'unlinked'),
@@ -11241,7 +11396,7 @@ function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, 
   return jsxs('div', {
     className: 'pcc-kcol',
     'data-drop': over ? 'true' : 'false',
-    style: S.column,
+    style: S.kcol,
     children: [
       jsx('div', {
         style: S.colHeader,
@@ -11287,6 +11442,20 @@ function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, 
           ]
         })
       }),
+      // "Release now and it lands HERE", in words. The tinted column alone was too
+      // quiet to answer the question a person asks mid-drag, and the drag leaves the
+      // header behind as soon as the cursor moves into the card area.
+      over
+        ? jsx(
+            'div',
+            {
+              'aria-hidden': 'true',
+              style: S.kdropHint,
+              children: [jsx(Codicon, { name: 'arrow-down', size: '0.6875rem' }), `Release to drop in ${lane.label}`]
+            },
+            'drop-hint'
+          )
+        : null,
       jsxs('div', {
         onDragLeave: event => {
           if (!event.currentTarget.contains(event.relatedTarget)) onDragOver('')
@@ -11466,6 +11635,30 @@ function KanbanViews({ byLane, collapsed, counts, direction, dragCard, dropLane,
   })
 }
 
+// Archived sessions, which no other read returns. `session.list` filters them out
+// inside the gateway, so this is the plugin's own route against the same state
+// database. One read for the whole board, riding a 60 s interval: archiving is rare,
+// and the route scans the store.
+function useArchivedSessions() {
+  const query = useQuery({
+    queryFn: () => boardRest(`/sessions/archived?limit=${ARCHIVED_LIMIT}`).catch(() => null),
+    queryKey: [QUERY_ROOT, 'sessions', 'archived'],
+    refetchInterval: 60000,
+    retry: false,
+    staleTime: 30000
+  })
+  const payload = query.data && query.data.ok === true ? query.data : null
+
+  return {
+    query,
+    // A failed read is NOT zero archived sessions: the footer says it could not
+    // read them, because a confident 0 would read as "nothing is hidden".
+    failed: Boolean(query.isFetched && !payload),
+    rows: payload && Array.isArray(payload.sessions) ? payload.sessions : [],
+    total: payload ? Number(payload.total) || 0 : 0
+  }
+}
+
 // The reads and the card shape every session view shares: the tree (labels and
 // folders), the gateway's session list, /board's links and the PR refs the lane
 // rule reads. One hook, so the two views cost no extra network calls.
@@ -11518,12 +11711,16 @@ function useSessionCards(lanes) {
   const refsByProject = useProjectRefs(projects, boardState.links)
   const branches = useProjectBranches(projects)
 
+  const folders = useMemo(() => projectFoldersOf(projects), [projects])
+  const showArchived = useValue($showArchived)
+  const archived = useArchivedSessions()
   const cards = useMemo(
     () =>
       kanbanCardsFrom(
         sessionsQuery.data && Array.isArray(sessionsQuery.data.sessions) ? sessionsQuery.data.sessions : [],
         {
           branches,
+          folders,
           join,
           lanes,
           linkBySession,
@@ -11534,10 +11731,98 @@ function useSessionCards(lanes) {
           statuses
         }
       ),
-    [sessionsQuery.data, linkBySession, projectById, join, refsByProject, statuses, branches, overrides, lanes]
+    [
+      sessionsQuery.data,
+      linkBySession,
+      projectById,
+      join,
+      refsByProject,
+      statuses,
+      branches,
+      overrides,
+      lanes,
+      folders
+    ]
   )
+  // Archived rows ride the same builder through the same join, so a card that came
+  // back from the archive looks and moves exactly like the new ones: same lane rule,
+  // same project, same drag. They are only on the board while the filter is on.
+  const archivedCards = useMemo(() => {
+    if (!showArchived || archived.rows.length === 0) return []
 
-  return { boardState, cards, live, projectById, projects, sessionsQuery, tree }
+    return kanbanCardsFrom(archived.rows, {
+      branches,
+      folders,
+      join,
+      lanes,
+      linkBySession,
+      now: Date.now(),
+      overrides,
+      projectById,
+      refsByProject,
+      statuses
+    })
+  }, [
+    showArchived,
+    archived.rows,
+    branches,
+    folders,
+    join,
+    lanes,
+    linkBySession,
+    overrides,
+    projectById,
+    refsByProject,
+    statuses
+  ])
+  const allCards = useMemo(() => (archivedCards.length ? [...cards, ...archivedCards] : cards), [cards, archivedCards])
+
+  return { archived, boardState, cards: allCards, live, projectById, projects, sessionsQuery, showArchived, tree }
+}
+
+// The board's one control for archived sessions, and the reason the board looked
+// emptier than the session list: the gateway's `session.list` never returns an
+// archived row, so nothing without this could even mention them.
+function ArchivedFooter({ archived, on, onToggle }) {
+  const total = archived.total
+  const shown = archived.rows.length
+  // Nothing hidden and nothing shown: no footnote to print.
+  if (!archived.failed && total === 0 && !on) return null
+  const plural = total === 1 ? 'session' : 'sessions'
+  const text = archived.failed
+    ? 'Archived sessions could not be read'
+    : on
+      ? shown < total
+        ? `Showing the newest ${shown.toLocaleString()} of ${total.toLocaleString()} archived ${plural}`
+        : `Showing ${total.toLocaleString()} archived ${plural}`
+      : `${total.toLocaleString()} archived ${plural}`
+  const label = archived.failed ? 'Retry' : on ? 'Hide' : 'Show'
+
+  return jsxs('button', {
+    'aria-pressed': on,
+    className: 'pcc-archived-bar',
+    onClick: () => {
+      if (archived.failed) {
+        archived.query.refetch()
+
+        return
+      }
+
+      onToggle(!on)
+    },
+    style: on || archived.failed ? { ...S.archivedBar, ...S.archivedBarOn } : S.archivedBar,
+    title: archived.failed
+      ? 'Archived sessions could not be read. Activate to try again.'
+      : on
+        ? 'Hide archived sessions from the board'
+        : 'Archived sessions are hidden from the board. Activate to show them.',
+    type: 'button',
+    children: [
+      jsx(Codicon, { name: archived.failed ? 'warning' : 'archive', size: '0.75rem' }),
+      jsx('span', { children: text }),
+      jsx('span', { style: S.archivedBarLabel, children: label })
+    ]
+  })
 }
 
 // The Status view. It renders one filtered card list two ways: the kanban and
@@ -11556,7 +11841,7 @@ function SessionsKanbanPage() {
   const laneState = useLaneTable()
   const ordered = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
   const collapsedLanes = useValue($collapsed)
-  const { boardState, cards, live, projects, sessionsQuery } = useSessionCards(ordered)
+  const { archived, boardState, cards, live, projects, sessionsQuery, showArchived } = useSessionCards(ordered)
 
   // A lane deleted while this tab was open leaves cards pointing at it; the
   // filter list is placed on the live table, so those cards surface in the first
@@ -11767,7 +12052,8 @@ function SessionsKanbanPage() {
             ]
           })
         : null,
-      body
+      body,
+      jsx(ArchivedFooter, { archived, on: showArchived, onToggle: setArchivedFilter })
     ]
   })
 }

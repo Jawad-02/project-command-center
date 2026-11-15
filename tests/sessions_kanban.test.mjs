@@ -885,6 +885,7 @@ test('every stored choice, the fold map included, is restored when the plugin re
     $ghPreset: mkAtom(),
     $lanes: mkAtom(),
     $openProject: mkAtom(),
+    $showArchived: mkAtom(),
     $sort: mkAtom(),
     $statuses: mkAtom(),
     $view: mkAtom()
@@ -892,9 +893,10 @@ test('every stored choice, the fold map included, is restored when the plugin re
   const restoreStoredState = new Function(
     ...Object.keys(atoms),
     'readLanes', 'readStatuses', 'readSort', 'readView', 'readGhPreset', 'readOpenProject', 'readCollapsed',
+    'readShowArchived',
     `${grab('restoreStoredState')}\nreturn restoreStoredState`
   )
-  const stored = { lanes: [{ id: 'active' }], collapsed: { active: true, backlog: false }, preset: 'prs', project: 'p1', sort: 'activity', statuses: { p1: 'active' }, view: 'status' }
+  const stored = { lanes: [{ id: 'active' }], collapsed: { active: true, backlog: false }, preset: 'prs', project: 'p1', sort: 'activity', statuses: { p1: 'active' }, view: 'status', archived: true }
 
   restoreStoredState(
     ...Object.values(atoms),
@@ -904,11 +906,15 @@ test('every stored choice, the fold map included, is restored when the plugin re
     () => stored.view,
     () => stored.preset,
     () => stored.project,
-    () => stored.collapsed
+    () => stored.collapsed,
+    () => stored.archived
   )()
 
   assert.deepEqual(atoms.$collapsed.get(), stored.collapsed, 'a folded lane is still folded after a reload')
   assert.equal(atoms.$view.get(), 'status')
+  // The archived switch is a stored choice like the rest: a filter that silently
+  // forgets itself on every reload is not a filter.
+  assert.equal(atoms.$showArchived.get(), stored.archived, 'the archived filter is restored too')
 
   // And register is what calls it: without this line the restores never run.
   const register = source.slice(source.indexOf('  register(ctx) {'), source.indexOf('    ctx.registerMany(['))

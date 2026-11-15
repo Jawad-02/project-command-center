@@ -4494,6 +4494,78 @@ def goals(session_ids: str = Query("", description="Comma separated session ids,
     return payload
 
 
+# --- Archived sessions -------------------------------------------------------
+#
+# `session.list` reads `list_sessions_rich` without `archived_only`, so an archived session is
+# absent from EVERY board row. That is not a rare state on a working machine: one store here holds
+# 1,929 archived sessions out of 2,010, and from the Desktop that reads as sessions vanishing. The
+# gateway method exposes no archived flag (`include_hidden` is a different flag), so the plugin
+# reads its own state database through the same published `hermes_state` surface the goals read
+# uses. This is the ONLY route here that answers for rows the gateway will not list.
+
+ARCHIVED_MAX = 300
+ARCHIVED_TTL = 30
+
+
+@router.get("/sessions/archived")
+def sessions_archived(limit: int = Query(ARCHIVED_MAX, ge=1, le=ARCHIVED_MAX)) -> dict[str, Any]:
+    """Archived sessions, newest first, plus the real total.
+
+    ``{"ok": true, "total": 1929, "sessions": [{id, title, source, cwd, git_branch, started_at,
+    last_active, message_count}]}``. ``total`` is the count of every archived session, not
+    ``len(sessions)``, so the indicator can say "the newest 300 of 1,929" instead of quietly
+    reporting the cap as the truth.
+
+    ``ok: false`` with ``sessions_unavailable`` is an unreadable state database, never a 500 and
+    never an empty success: the caller renders a sentence, not a confident zero.
+
+    ``def``, not ``async def``: this is a blocking SQLite read, so FastAPI must run it in the
+    threadpool rather than on the gateway event loop. One handle per request, closed in the
+    ``finally``, cached 30 s.
+    """
+    key: tuple[Any, ...] = ("sessions", "archived", limit)
+    cached = _cache_hit(key)
+    if cached is not None:
+        return cached
+    try:
+        db = _goal_db()
+    except Exception as exc:
+        log.warning("sessions: the Hermes state database is unavailable: %s", exc)
+        return {"ok": False, "code": "sessions_unavailable",
+                "error": "Archived sessions are unavailable because this Hermes build has no "
+                         "readable state database."}
+    try:
+        rows = db.list_sessions_rich(archived_only=True, compact_rows=True, limit=limit,
+                                     order_by_last_active=True)
+        total = int(db.session_count(archived_only=True))
+    except Exception as exc:
+        log.warning("sessions: archived listing failed: %s", exc)
+        return {"ok": False, "code": "sessions_unavailable",
+                "error": f"Archived sessions could not be read: {type(exc).__name__}."}
+    finally:
+        try:
+            db.close()
+        except Exception:  # a read-only handle that cannot close is already spent
+            log.debug("sessions: the read-only state.db handle did not close cleanly", exc_info=True)
+    sessions = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        sessions.append({
+            "id": str(row.get("id")),
+            "title": str(row.get("title") or ""),
+            "source": str(row.get("source") or ""),
+            "cwd": str(row.get("cwd") or ""),
+            "git_branch": str(row.get("git_branch") or ""),
+            "started_at": row.get("started_at"),
+            "last_active": row.get("last_active"),
+            "message_count": _int(row.get("message_count")),
+        })
+    payload = {"ok": True, "total": total, "sessions": sessions}
+    _cache_put(key, payload, ttl=ARCHIVED_TTL)
+    return payload
+
+
 # --- Board state -------------------------------------------------------------
 #
 # The rows live in board_store.py's SQLite file; nothing about the board is cached here. The module

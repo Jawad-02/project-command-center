@@ -62,7 +62,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'board-live-archived.2026-11-15T0530Z'
+const PLUGIN_BUILD = 'board-motion-archived.2026-11-15T0620Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -2342,6 +2342,19 @@ const CSS_TEXT = `
 .pcc-kcard[data-dragging="true"] { opacity: 0.5; }
 .pcc-kcol:not(.pcc-krail) { border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); background: color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent); transition: border-color 120ms ease, background-color 120ms ease; }
 .pcc-kcol[data-drop="true"] { border-color: var(--ui-accent); background: color-mix(in srgb, var(--ui-accent) 6%, transparent); }
+@keyframes pcc-hint-in {
+  from { max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; transform: translateY(-3px); }
+  to { max-height: 48px; opacity: 1; transform: none; }
+}
+.pcc-kdrop-hint { animation: pcc-hint-in 170ms cubic-bezier(0.22, 1, 0.36, 1) both; overflow: hidden; }
+@keyframes pcc-drop-in {
+  from { opacity: 0; transform: translateY(-7px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.pcc-kcard[data-dropped="true"] { animation: pcc-drop-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+@media (prefers-reduced-motion: reduce) {
+  .pcc-kdrop-hint, .pcc-kcard[data-dropped="true"] { animation: none !important; }
+}
 @media (prefers-reduced-motion: reduce) { .pcc-kcol:not(.pcc-krail) { transition: none !important; } }
 .pcc-krail { border: 1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent); background: color-mix(in srgb, var(--ui-bg-elevated) 55%, transparent); transition: background-color 120ms ease, border-color 120ms ease; }
 .pcc-krail:hover { background: color-mix(in srgb, var(--chrome-action-hover) 80%, transparent); border-color: var(--ui-stroke-secondary); }
@@ -2440,7 +2453,8 @@ const S = {
     alignItems: 'center',
     gap: 5,
     flex: 'none',
-    margin: '0 10px 8px',
+    // Air above: the header's own border was sitting straight on top of it.
+    margin: '8px 10px 8px',
     padding: '6px 8px',
     borderRadius: 8,
     border: '1px dashed var(--ui-accent)',
@@ -10460,6 +10474,7 @@ function ProjectsPage() {
             ? jsx('span', { style: S.goalNote, children: 'Goal status unavailable' })
             : null,
           jsx('span', { style: S.grow }),
+          jsx(ArchivedToggle, { archived: archivedState, on: showArchived, onToggle: setArchivedFilter }),
           jsx(SessionLaneFilter, { laneFilter, lanes: laneRows, onToggle: toggleLane }),
           jsx(SortPicker, { sort: sortId }),
           jsx('div', {
@@ -11266,10 +11281,13 @@ function KanbanProjectTag({ card, onOpenProject }) {
   })
 }
 
-function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpenProject, onOpenSession, state }) {
+function KanbanCard({ card, dragId, dropped, lanes, onDragEnd, onDragStart, onMove, onOpenProject, onOpenSession, state }) {
   return jsxs('div', {
     'aria-label': `${card.title}. ${laneLabel(card.lane, lanes)} lane.`,
     className: 'pcc-kcard',
+    // Only the card that just landed animates. A blanket mount animation would pop
+    // every card on every filter change, which reads as churn, not as feedback.
+    'data-dropped': dropped === card.id ? 'true' : 'false',
     'data-dragging': dragId === card.id ? 'true' : 'false',
     draggable: true,
     // The card opens its session, but the ellipsis menu, the lane rows and any
@@ -11342,7 +11360,7 @@ function KanbanCard({ card, dragId, lanes, onDragEnd, onDragStart, onMove, onOpe
   })
 }
 
-function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onToggle, states }) {
+function KanbanColumn({ cards, collapsed, count, dropLane, dragId, dropped, lanes, lane, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onToggle, states }) {
   const over = dropLane === lane.id
   const toggle = () => {
     if (typeof onToggle === 'function') onToggle(lane.id)
@@ -11450,6 +11468,7 @@ function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, 
             'div',
             {
               'aria-hidden': 'true',
+              className: 'pcc-kdrop-hint',
               style: S.kdropHint,
               children: [jsx(Codicon, { name: 'arrow-down', size: '0.6875rem' }), `Release to drop in ${lane.label}`]
             },
@@ -11477,6 +11496,7 @@ function KanbanColumn({ cards, collapsed, count, dropLane, dragId, lanes, lane, 
                 {
                   card,
                   dragId,
+                  dropped,
                   lanes,
                   onDragEnd,
                   onDragStart,
@@ -11589,7 +11609,7 @@ function KanbanTable({ cards, direction, lanes, onMove, onOpenProject, onOpenSes
 
 // Both views take the same filtered list and the same move handler; only the
 // arrangement changes.
-function KanbanViews({ byLane, collapsed, counts, direction, dragCard, dropLane, lanes, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onSortLane, onToggleCollapse, states, view }) {
+function KanbanViews({ byLane, collapsed, counts, direction, dragCard, dropLane, dropped, lanes, onDragEnd, onDragOver, onDragStart, onDrop, onMove, onOpenProject, onOpenSession, onSortLane, onToggleCollapse, states, view }) {
   if (view === 'table') {
     const all = []
 
@@ -11617,6 +11637,7 @@ function KanbanViews({ byLane, collapsed, counts, direction, dragCard, dropLane,
           count: counts[lane.id] || 0,
           dragId: dragCard ? dragCard.id : '',
           dropLane,
+          dropped,
           lanes,
           lane,
           onDragEnd,
@@ -11780,6 +11801,36 @@ function useSessionCards(lanes) {
   return { archived, boardState, cards: allCards, live, projectById, projects, sessionsQuery, showArchived, tree }
 }
 
+// The toolbar door to the same switch the footer carries. Two controls, one atom: a
+// count at the bottom answers "why is my board empty", and a filter button next to the
+// other filters is where a hand goes looking for it. Disabled while the read is broken,
+// with the sentence that says where to fix it.
+function ArchivedToggle({ archived, on, onToggle }) {
+  const count = archived.failed ? 0 : archived.total
+  const title = archived.failed
+    ? 'Archived sessions could not be read. Use Retry under the board.'
+    : on
+      ? 'Hide archived sessions'
+      : count > 0
+        ? `Show ${count.toLocaleString()} archived ${count === 1 ? 'session' : 'sessions'}`
+        : 'No archived sessions to show'
+
+  return jsx(Tip, {
+    label: title,
+    children: jsxs(Button, {
+      'aria-pressed': on,
+      disabled: archived.failed,
+      onClick: () => {
+        if (archived.failed) return
+        onToggle(!on)
+      },
+      size: 'sm',
+      variant: on ? 'default' : 'outline',
+      children: [jsx(Codicon, { name: 'archive', size: '0.875rem' }), 'Archived']
+    })
+  })
+}
+
 // The board's one control for archived sessions, and the reason the board looked
 // emptier than the session list: the gateway's `session.list` never returns an
 // archived row, so nothing without this could even mention them.
@@ -11837,6 +11888,16 @@ function SessionsKanbanPage() {
   const [laneDirection, setLaneDirection] = useState(1)
   const [dragCard, setDragCard] = useState(null)
   const [dropLane, setDropLane] = useState('')
+  // The card that just landed. Cleared on a timer, so the settle animation plays
+  // once and a re-render (a poll, a filter) cannot restart it.
+  const [droppedId, setDroppedId] = useState('')
+
+  useEffect(() => {
+    if (!droppedId) return
+    const timer = setTimeout(() => setDroppedId(''), 400)
+
+    return () => clearTimeout(timer)
+  }, [droppedId])
   const [spin, setSpin] = useState(false)
   const laneState = useLaneTable()
   const ordered = useMemo(() => laneTableOrDefaults(laneState.rows), [laneState.rows])
@@ -11893,6 +11954,7 @@ function SessionsKanbanPage() {
     setDragCard(null)
     setDropLane('')
     dropCard(card, laneId)
+    if (card && card.id) setDroppedId(String(card.id))
   }
 
   const refresh = () => {
@@ -11946,6 +12008,7 @@ function SessionsKanbanPage() {
       direction: laneDirection,
       dragCard,
       dropLane,
+      dropped: droppedId,
       lanes: ordered,
       onDragEnd: () => {
         setDragCard(null)
@@ -12005,6 +12068,7 @@ function SessionsKanbanPage() {
             options: KANBAN_SOURCE_FILTERS,
             value: sourceFilter
           }),
+          jsx(ArchivedToggle, { archived, on: showArchived, onToggle: setArchivedFilter }),
           jsx(Tip, {
             label: 'Only sessions not in done, untouched for three days',
             children: jsx(Button, {

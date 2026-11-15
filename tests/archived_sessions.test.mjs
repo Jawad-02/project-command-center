@@ -72,6 +72,27 @@ test('the hovered lane says the drop will land there, in words', () => {
   assert.match(source, /  kdropHint: \{/, 'the hint style must exist')
 })
 
+test('the hint has air above it and arrives instead of snapping in', () => {
+  // The header's border sat directly on the hint, and an instant block of text
+  // appearing under the cursor read as a glitch rather than as feedback.
+  assert.match(source, /  kdropHint: \{[\s\S]{0,400}?margin: '8px 10px 8px'/, 'the hint needs space above it')
+  assert.match(source, /@keyframes pcc-hint-in \{/, 'the hint needs its own animation')
+  assert.match(source, /\.pcc-kdrop-hint \{ animation: pcc-hint-in/, 'the animation must be applied')
+  assert.match(columnSource(), /className: 'pcc-kdrop-hint'/, 'the hint element must carry the class')
+  // And reduced motion wins: a drag is not a place to insist on an animation.
+  assert.match(source, /\.pcc-kdrop-hint, \.pcc-kcard\[data-dropped="true"\] \{ animation: none !important; \}/, 'reduced motion must disable it')
+})
+
+test('only the card that landed animates, and only once', () => {
+  assert.match(cardSource(), /'data-dropped': dropped === card\.id \? 'true' : 'false'/, 'the flag is per card')
+  assert.match(source, /@keyframes pcc-drop-in \{/, 'the settle animation must exist')
+  assert.match(source, /\.pcc-kcard\[data-dropped="true"\] \{ animation: pcc-drop-in/, 'and be applied')
+  // Set on drop, cleared on a timer: a card that keeps the flag replays the
+  // animation on every re-render (each poll), which looks like a nervous tick.
+  assert.match(source, /if \(card && card\.id\) setDroppedId\(String\(card\.id\)\)/, 'a drop records the card')
+  assert.match(source, /setTimeout\(\(\) => setDroppedId\(''\), 400\)/, 'and the flag is cleared')
+})
+
 test('the column is still the drop target it was, not a click-through', () => {
   const column = columnSource()
 
@@ -95,10 +116,16 @@ test('the archived read is the plugin route, because session.list cannot answer'
   assert.match(source, new RegExp(`const ARCHIVED_LIMIT = ${cap}\\b`), 'the two caps must be the same number')
 })
 
-test('the footer is the ONE control, and both views render it', () => {
-  const renders = [...source.matchAll(/jsx\(ArchivedFooter, \{/g)]
+test('the switch is in both toolbars and both footers, and is disabled while broken', () => {
+  const footers = [...source.matchAll(/jsx\(ArchivedFooter, \{/g)]
+  const toggles = [...source.matchAll(/jsx\(ArchivedToggle, \{/g)]
 
-  assert.equal(renders.length, 2, 'Status and Projects must both offer the switch')
+  assert.equal(footers.length, 2, 'Status and Projects must both carry the count')
+  assert.equal(toggles.length, 2, 'and both must offer the button a hand goes looking for')
+  // A filter that can be turned on while its source is unreadable shows an empty
+  // board; this one explains itself and stays off until the read answers.
+  assert.match(source, /disabled: archived\.failed/, 'the toggle must refuse while the read is broken')
+  assert.match(source, /Archived sessions could not be read\. Use Retry under the board\./, 'and say where to fix it')
   assert.match(source, /function setArchivedFilter\(/, 'both views write the filter through one function')
   // An archived card that looks like a live one is a trap: the rows say so.
   assert.match(source, /card\.archived\s*\n?\s*\? jsx\('span', \{ style: \{ \.\.\.S\.chip, color: 'var\(--ui-orange\)' \}, children: 'Archived' \}/, 'the kanban card must be marked')

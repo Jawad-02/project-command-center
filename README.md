@@ -53,6 +53,12 @@ The whole issue, not a summary of it: markdown body, labels, assignees, and the 
 
 ![A reference chip with its preview](./docs/screenshots/ref-preview.png)
 
+### References arrive as cards, in the chat itself
+
+When the agent references an issue or a pull request in its own reply, the reference lands as a small card inside the message: the GitHub state colour, the number, the title, who opened it and how long ago. Click it and the same detail view opens in place, thread and all. Follow a link inside it and you get a back chevron, so a chain of references does not lose your place.
+
+The agent writes that card itself (`::pcc-gh{url="…"}`, a transcript directive this plugin registers), and it is told how to on every turn. A plain link stays a plain link, so nothing is invented and nothing is guessed.
+
 ## History that looks like history
 
 A commit graph with real lanes. Fork, merge, track across branches, and open any commit to read its diff, files and line changes.

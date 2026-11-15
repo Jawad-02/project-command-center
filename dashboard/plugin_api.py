@@ -109,7 +109,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.2"
+PLUGIN_VERSION = "0.5.0"
 GIT_TIMEOUT = 5.0
 # A checkout is the one git call that can legitimately take minutes: a large tree,
 # an LFS smudge, a slow disk. Killing it mid-run leaves a half-moved work tree and

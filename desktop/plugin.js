@@ -42,6 +42,7 @@ import {
   StatusDot,
   Textarea,
   Tip,
+  TRANSCRIPT_DIRECTIVE_AREA,
   atom,
   fmtDateTime,
   host,
@@ -61,7 +62,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'review-round-three.2026-11-13T2130Z'
+const PLUGIN_BUILD = 'inline-gh-cards.2026-11-15T0210Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -2919,6 +2920,61 @@ const S = {
     fontSize: '0.625rem',
     fontFamily: 'var(--font-mono, ui-monospace, monospace)'
   },
+  // ── inline reference cards ─────────────────────────────────────────────────
+  ghInlineRoot: { display: 'flex', width: '100%', minWidth: 0 },
+  // An inline reference card in the transcript. It lives in a chat paragraph, so
+  // it takes the message column's width (never a fixed one), keeps two lines of
+  // text and the same height whether it is loading, answered or refused — a card
+  // that grows when the network answers jumps the paragraph under the reader.
+  ghInlineCard: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: 8,
+    boxSizing: 'border-box',
+    width: '100%',
+    maxWidth: 560,
+    minHeight: 44,
+    margin: '2px 0',
+    padding: '7px 9px',
+    borderRadius: 8,
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 75%, transparent)',
+    background: 'color-mix(in srgb, var(--ui-bg-elevated) 70%, transparent)',
+    color: 'var(--ui-text-primary)',
+    font: 'inherit',
+    textAlign: 'left',
+    overflow: 'hidden'
+  },
+  ghInlineButton: { cursor: 'pointer' },
+  ghInlineBody: { display: 'flex', flexDirection: 'column', gap: 2, flex: '1 1 0', minWidth: 0 },
+  ghInlineTop: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 },
+  ghInlineNum: {
+    flex: 'none',
+    fontSize: '0.75rem',
+    fontVariantNumeric: 'tabular-nums',
+    color: 'var(--ui-text-tertiary)'
+  },
+  ghInlineTitle: {
+    flex: '1 1 0',
+    minWidth: 0,
+    fontSize: '0.8125rem',
+    lineHeight: 1.35,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap'
+  },
+  ghInlineMeta: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    minWidth: 0,
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-quaternary)',
+    overflow: 'hidden',
+    whiteSpace: 'nowrap',
+    textOverflow: 'ellipsis'
+  },
+  ghInlineIcon: { flex: 'none', paddingTop: 2 },
+  ghInlineState: { flex: 'none', fontSize: '0.6875rem' },
   // ── detail modal ───────────────────────────────────────────────────────────
   // Same vocabulary as the rows, one step roomier: the dialog already supplies
   // the surface, the padding and the scroll, so these only lay out content.
@@ -6095,6 +6151,9 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
         // and a refs payload cached before the write would keep that chip missing
         // for its whole staleTime. Drop the refs reads with the thread.
         queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'refs'] })
+        // A reference card in a chat draws its state from its own read, so a
+        // comment that reopens or closes an item must repaint the card too.
+        queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'inline'] })
 
         return
       }
@@ -6114,6 +6173,9 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
         setNote('')
         queryClient.invalidateQueries({ queryKey: detailKey })
         queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'open', folder] })
+        // Closed and reopened from the modal: the card that opened it says Open
+        // while the item is closed until its own read is dropped.
+        queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'inline'] })
 
         return
       }
@@ -6332,6 +6394,350 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, p
           detail ? jsx(GhDetailThread, { detail, folder, kind, number, onOpen, owner, projectId, repo }) : null
         ]
       })
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------
+// pcc-inline:begin
+// Inline GitHub reference cards in the transcript.
+//
+// The chat transcript is core, and a plugin's only door into it is the
+// `transcript.directives` area: the agent writes `::pcc-gh{url="…"}` beside a
+// reference it is making and the card below claims it. A name no plugin claimed
+// stays the prose it was, so everything a card decides is decided here, before
+// anything is drawn. The pure half lives between these markers so
+// tests/inline_cards.test.mjs can slice it out and run it in a vm.
+const GH_INLINE_DIRECTIVE = 'pcc-gh'
+const GH_INLINE_URL_RE = /^https?:\/\/(?:www\.)?github\.com\/([^/\s?#]+)\/([^/\s?#]+)\/(issues|pull)\/(\d+)/i
+const GH_INLINE_SLUG_RE = /^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9._-]+)$/
+const GH_INLINE_NUMBER_RE = /^\s*#?(\d+)\s*$/
+
+function ghInlineKind(value) {
+  const word = String(value || '').trim().toLowerCase()
+
+  if (word === 'pr' || word === 'pull' || word === 'pull-request' || word === 'pull request') return 'pr'
+
+  return 'issue'
+}
+
+// `{ ok: true, ref }` or `{ ok: false, reason }`.
+//
+// `url` wins when both are given: a URL names the repository itself, so it can
+// never be drawn as this project's #12 by accident. A comment permalink
+// (`#issuecomment-…`, `#discussion_r…`) collapses to the item that holds it:
+// this cut draws issues and pull requests, and a card that claimed to be a
+// comment while opening the whole thread would promise something it does not do.
+function ghInlineRef(attrs) {
+  const raw = attrs && typeof attrs === 'object' ? attrs : {}
+  const url = String(raw.url || '').trim()
+
+  if (url) {
+    const match = GH_INLINE_URL_RE.exec(url)
+
+    if (!match) return { ok: false, reason: 'not_github' }
+
+    return {
+      ok: true,
+      ref: {
+        owner: match[1],
+        repo: match[2].replace(/\.git$/i, ''),
+        kind: match[3].toLowerCase() === 'pull' ? 'pr' : 'issue',
+        number: Number(match[4]) || 0,
+        url
+      }
+    }
+  }
+
+  const number = GH_INLINE_NUMBER_RE.exec(String(raw.number || ''))
+  const slug = GH_INLINE_SLUG_RE.exec(String(raw.repo || '').trim())
+
+  // `#0` is not a number GitHub has: a card that drew it as one would open a URL
+  // that 404s and claim the reference resolved.
+  if (!number || Number(number[1]) < 1) return { ok: false, reason: 'no_number' }
+  if (!slug) return { ok: false, reason: 'no_repo' }
+
+  return {
+    ok: true,
+    ref: { owner: slug[1], repo: slug[2], kind: ghInlineKind(raw.kind), number: Number(number[1]) || 0, url: '' }
+  }
+}
+
+function ghInlineKey(ref) {
+  if (!ref || !ref.number) return ''
+
+  return `${String(ref.owner).toLowerCase()}/${String(ref.repo).toLowerCase()}#${ref.number}`
+}
+
+// Where a card goes when it cannot read GitHub itself: the address the agent
+// wrote, else the canonical one.
+function ghInlineUrl(ref) {
+  if (!ref) return ''
+  if (ref.url) return ref.url
+
+  return `https://github.com/${ref.owner}/${ref.repo}/${ref.kind === 'pr' ? 'pull' : 'issues'}/${ref.number}`
+}
+
+// `/github/refs` answers for THIS project's folder, so a reference to another
+// repository would come back holding this repository's #12. Compare first and
+// draw a card second; a truthful link beats a confident wrong card.
+function ghInlineSameRepo(ref, repo) {
+  if (!ref || !repo) return false
+
+  return (
+    String(ref.owner).toLowerCase() === String(repo.owner || '').toLowerCase() &&
+    String(ref.repo).toLowerCase() === String(repo.repo || '').toLowerCase()
+  )
+}
+
+function ghInlineRow(payload, number) {
+  if (!payload || payload.ok !== true || !payload.refs || typeof payload.refs !== 'object') return null
+  const row = payload.refs[String(number)]
+
+  return row && typeof row === 'object' ? row : null
+}
+
+// Whether a card may open the command center at all.
+//
+// The only thing that blocks it is the WRONG REPOSITORY. `GhDetailModal` resolves
+// its item by the FOLDER's number, so opening it for another repository (or
+// before the folder's repository is known) would show this project's item of the
+// same number, with its comment box and Close button. Everything else belongs in
+// the modal, including a read that failed or a number GitHub does not have: the
+// modal does its own read and explains itself in place, which is the whole point
+// of having a card. Kicking the reader out to a browser is the worse answer.
+function ghInlineOpenable({ folder, number, sameRepo }) {
+  return Boolean(folder && Number(number) > 0 && sameRepo === true)
+}
+
+// One sentence for a folder whose repository could not be read.
+//
+// `/repo` answers its refusals as codes with HTTP 200, so "no payload" is not the
+// same as "not a repository": a missing folder and a git that timed out would
+// both be reported as "this is not a git repository", which is a confident wrong
+// diagnosis of a different problem.
+function ghInlineRepoText(payload) {
+  if (!payload || typeof payload !== 'object') return 'could not read this folder'
+  const code = String(payload.code || '')
+
+  if (code === 'not_a_repo') return 'this folder is not a git repository'
+  if (code === 'no_remote') return 'this folder has no git remote'
+  if (code === 'folder_missing') return 'this folder is missing'
+
+  return String(payload.error || 'could not read this folder')
+}
+// pcc-inline:end
+
+function ghOpenExternal(url) {
+  const value = String(url || '')
+
+  if (!value) return
+  const os = pluginCtx && pluginCtx.os
+
+  if (!os || typeof os.openExternal !== 'function') {
+    host.notify({ kind: 'warning', message: 'This Desktop build cannot open a browser window.' })
+
+    return
+  }
+
+  Promise.resolve(os.openExternal(value)).then(ok => {
+    if (ok === false) host.notify({ kind: 'warning', message: 'Could not open the browser.' })
+  })
+}
+
+// `host.state` atoms resolved to a STABLE atom so `useValue` can subscribe: a
+// missing atom on an older build falls back to one shared empty atom rather than
+// handing `useValue` an undefined.
+const $NO_PANE = atom('')
+
+function paneAtom(name) {
+  const value = host.state ? host.state[name] : null
+
+  return value && typeof value.get === 'function' ? value : $NO_PANE
+}
+
+// The project a chat's cards read from: the board's link row names it, else the
+// tree's `sessionIds` claim. Both reads are already on the wire under the query
+// keys the board and the project page use, so a card costs no request of its own.
+function useInlineCardProject(sessionId) {
+  const links = useBoardLinks()
+  const tree = useQuery({
+    queryFn: () => host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT, ...profileParam() }),
+    queryKey: [QUERY_ROOT, 'tree'],
+    staleTime: 4000
+  })
+  // SUBSCRIBE to the pane instead of reading it. The folder fallback below
+  // belongs to the focused pane, and a plain atom read returns a value without a
+  // subscription, so a card painted while its pane was unfocused would keep its
+  // "no project folder" answer until some unrelated query happened to update.
+  const paneSession = useValue(paneAtom('focusedStoredSessionId'))
+  const paneCwd = useValue(paneAtom('cwd'))
+
+  // Deliberately NOT memoized: the scan is a find over the project list, and the
+  // pane values above arrive as render inputs.
+  const list = tree.data && Array.isArray(tree.data.projects) ? tree.data.projects : []
+  // The Home bucket claims every unowned session; it is not a project.
+  const projects = list.filter(project => project && project.isNoProject !== true)
+  const linked = linkProjectForSession(links, sessionId)
+  const claimed =
+    linked || (projects.find(project => (project.sessionIds || []).includes(sessionId)) || {}).id || ''
+  const named = claimed ? projects.find(project => project.id === claimed) || null : null
+  // A chat with no link row yet still sits in a folder, and the project that owns
+  // that folder answers. The cwd belongs to the FOCUSED pane, so it is only a
+  // fallback for this pane's own chat: a card in a split view must never borrow
+  // the other pane's repository.
+  const ownCwd =
+    !sessionId || String(paneSession || '').trim() === sessionId ? String(paneCwd || '').trim() : ''
+  const byPath = !named && ownCwd ? projectForPath(projectFoldersOf(projects), ownCwd) : ''
+  const project = named || (byPath ? projects.find(node => node.id === byPath) || null : null)
+
+  return {
+    folder: project ? primaryPath(project) : '',
+    projectId: project && project.id ? String(project.id) : ''
+  }
+}
+
+// One GitHub reference, drawn in the assistant's own message. It reads like the
+// modal it opens: same glyph, same state colour, same wording for the state,
+// because two vocabularies for one issue is how a surface starts to feel foreign.
+function GhInlineCard({ attrs, sessionId, source }) {
+  const parsed = useMemo(() => ghInlineRef(attrs), [attrs])
+  const ref = parsed.ok ? parsed.ref : null
+  const project = useInlineCardProject(typeof sessionId === 'string' ? sessionId : '')
+  const folder = project.folder
+  const repoQuery = useQuery({
+    enabled: Boolean(folder),
+    queryFn: () => ghRest(`/repo?path=${encodeURIComponent(folder)}`),
+    queryKey: [QUERY_ROOT, 'repo', folder],
+    retry: false,
+    staleTime: 20000
+  })
+  const repo =
+    repoQuery.data && repoQuery.data.ok !== false && repoQuery.data.owner && repoQuery.data.repo
+      ? repoQuery.data
+      : null
+  const number = ref ? ref.number : 0
+  const sameRepo = ghInlineSameRepo(ref, repo)
+  const refsQuery = useQuery({
+    enabled: sameRepo,
+    queryFn: () => ghRest(`/github/refs?path=${encodeURIComponent(folder)}&numbers=${number}`),
+    queryKey: [QUERY_ROOT, 'github', 'inline', folder, number],
+    retry: false,
+    staleTime: 60000
+  })
+  const row = sameRepo ? ghInlineRow(refsQuery.data, number) : null
+  const kind = row && row.kind ? ghStatusKind(row.kind) : ref && ref.kind ? ref.kind : 'issue'
+  const payload = refsQuery.data || null
+  const readFailed = sameRepo && refsQuery.isFetched && (!payload || payload.ok !== true)
+  const usable = ghInlineOpenable({ folder, number, sameRepo })
+  const [stack, setStack] = useState([])
+  const target = ghInlineUrl(ref)
+  const entry = stack.length > 0 ? stack[stack.length - 1] : null
+  // The click guard asks the same question the button does, not a looser one: a
+  // handler that only checked `folder` is how a card for another repository would
+  // open THIS project's item of the same number, with its comment box.
+  const openItem = useCallback(() => {
+    if (!usable) return
+    setStack(prev => (prev.length ? prev : [{ kind, number }]))
+  }, [kind, number, usable])
+
+  // A reference whose attributes cannot be read keeps its own text on screen. A
+  // card that silently drew nothing would look like the message never had the
+  // reference at all, which is the failure mode this whole feature exists to
+  // remove.
+  if (!parsed.ok) {
+    return jsx('code', {
+      style: { fontSize: '0.75rem' },
+      title: `This GitHub card could not read its reference (${parsed.reason}).`,
+      children: source
+    })
+  }
+
+  const failure = readFailed ? String((payload && payload.error) || 'GitHub did not answer this read.') : ''
+  const missing = sameRepo && !readFailed && refsQuery.isFetched && !row
+  const loading = sameRepo && !refsQuery.isFetched
+  const look = ghStatusLook(kind, row || {})
+  const when = row && row.updated_at ? ageText(row.updated_at) : ''
+  const lines = []
+
+  if (row) {
+    lines.push(look.label, `${ref.owner}/${ref.repo}`)
+    if (row.author) lines.push(String(row.author))
+    if (when) lines.push(when)
+  } else {
+    lines.push(`${ref.owner}/${ref.repo}`)
+    if (!folder) lines.push('this chat has no project folder')
+    else if (!repoQuery.isFetched) lines.push('Reading GitHub…')
+    else if (repoQuery.isError) lines.push('could not read this folder')
+    else if (!repo) lines.push(ghInlineRepoText(repoQuery.data))
+    else if (!sameRepo) lines.push('another repository')
+    else if (loading) lines.push('Reading GitHub…')
+    else if (failure) lines.push(failure)
+    else if (missing) lines.push('no such number in this repository')
+  }
+
+  const title = row && row.title ? String(row.title) : loading ? 'Loading…' : missing ? 'No such reference' : ghKindWord(kind)
+
+  return jsxs('span', {
+    style: S.ghInlineRoot,
+    children: [
+      jsxs('button', {
+        className: 'pcc-inline-card',
+        'data-pcc-ref': ghInlineKey(ref),
+        onClick: usable ? openItem : () => ghOpenExternal(target),
+        style: { ...S.ghInlineCard, ...S.ghInlineButton },
+        title: usable
+          ? `Open ${ghKindWord(kind)} ${ghNumber(number)} in Project Command Center`
+          : failure || `${target} (opens on GitHub)`,
+        type: 'button',
+        children: [
+          jsx(Codicon, { name: look.name, size: '0.8125rem', style: { ...S.ghInlineIcon, color: look.color } }),
+          jsxs('span', {
+            style: S.ghInlineBody,
+            children: [
+              jsxs('span', {
+                style: S.ghInlineTop,
+                children: [
+                  jsx('span', { style: S.ghInlineNum, children: ghNumber(number) }),
+                  jsx('span', { style: S.ghInlineTitle, children: title })
+                ]
+              }),
+              jsx('span', {
+                style: { ...S.ghInlineMeta, color: failure ? 'var(--ui-red)' : 'var(--ui-text-quaternary)' },
+                children: lines.filter(Boolean).join(' · ')
+              })
+            ]
+          })
+        ]
+      }),
+      entry
+        ? jsx(
+            GhDetailModal,
+            {
+              depth: stack.length,
+              entry,
+              folder,
+              onBack: () => setStack(prev => prev.slice(0, -1)),
+              onClose: () => setStack([]),
+              onOpen: (nextKind, nextNumber) => {
+                const next = Number(nextNumber) || 0
+
+                if (!next) return
+                setStack(prev => [...prev, { kind: nextKind === 'pr' ? 'pr' : 'issue', number: next }])
+              },
+              // `owner` and `repo` are the two halves, never a slug: the modal
+              // composes `owner/repo` into drafts and issue URLs itself, so a
+              // slug here would read `acme/acme/app` in a session draft.
+              owner: repo ? String(repo.owner) : ref.owner,
+              projectId: project.projectId,
+              repo: repo ? String(repo.repo) : ref.repo
+            },
+            // Keyed like the GitHub section's own call site: without it the
+            // thread's draft, note and Close confirmation survive into the NEXT
+            // entry, and posting would write them to the wrong issue.
+            `${entry.kind}-${entry.number}`
+          )
+        : null
     ]
   })
 }
@@ -11431,6 +11837,21 @@ export default {
       // gets a page of its own that a tab can hold.
       { id: 'project-page', area: ROUTES_AREA, title: 'Project', data: { path: PROJECT_ROUTE }, render: () => jsx(ProjectDetailPage, {}) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: ROUTE, label: 'Projects', codicon: 'inbox' } },
+      // The transcript's only plugin door. The agent writes `::pcc-gh{url="…"}`
+      // beside a GitHub reference it is making and this claims it into a card
+      // that opens in the same detail modal the GitHub section uses. A turn with
+      // no registered claim leaves the raw directive as prose, which is why the
+      // model is only ever TOLD to write it while this plugin is loaded (the
+      // `pre_llm_call` line names the same `pcc-gh`).
+      {
+        id: 'inline-gh',
+        area: TRANSCRIPT_DIRECTIVE_AREA,
+        data: {
+          name: GH_INLINE_DIRECTIVE,
+          render: props =>
+            jsx(GhInlineCard, { attrs: props.attrs, sessionId: props.sessionId, source: props.source })
+        }
+      },
       {
         id: 'open',
         area: PALETTE_AREA,

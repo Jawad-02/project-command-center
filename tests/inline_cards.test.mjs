@@ -52,7 +52,10 @@ vm.runInThisContext(
   ghInlineSameRepo,
   ghInlineRow,
   ghInlineOpenable,
-  ghInlineRepoText
+  ghInlineRepoText,
+  ghInlineAnchor,
+  ghInlineComment,
+  ghInlineExcerpt
 }`,
   { filename: PLUGIN }
 )
@@ -204,6 +207,71 @@ test('the modal answers for a missing item itself, so the card still opens', () 
   assert.equal(I.ghInlineOpenable({ ...ok, row: null, readFailed: true }), true)
 })
 
+// --- comment permalinks -------------------------------------------------------
+
+test('a permalink that carries a comment anchor names the comment', () => {
+  const issue = I.ghInlineRef({ url: 'https://github.com/acme/app/issues/12#issuecomment-6886329479' })
+
+  assert.equal(issue.ref.kind, 'issue')
+  assert.equal(issue.ref.number, 12)
+  assert.deepEqual({ ...issue.ref.comment }, { id: 6886329479, kind: 'issue' })
+
+  // A review comment is a different object, and the thread read does not carry
+  // it: the kind has to survive parsing so the card can say so.
+  const review = I.ghInlineRef({ url: 'https://github.com/acme/app/pull/34#discussion_r99887766' })
+
+  assert.equal(review.ref.kind, 'pr')
+  assert.deepEqual({ ...review.ref.comment }, { id: 99887766, kind: 'review' })
+
+  const reviewObject = I.ghInlineRef({ url: 'https://github.com/acme/app/pull/34#pullrequestreview-55' })
+
+  assert.deepEqual({ ...reviewObject.ref.comment }, { id: 55, kind: 'review' })
+})
+
+test('a plain reference names no comment', () => {
+  assert.equal('comment' in I.ghInlineRef({ url: 'https://github.com/acme/app/issues/12' }).ref, false)
+  assert.equal('comment' in I.ghInlineRef({ repo: 'acme/app', number: '12' }).ref, false)
+  assert.equal(I.ghInlineAnchor('https://github.com/acme/app/issues/12'), null)
+  assert.equal(I.ghInlineAnchor('#issuecomment-0'), null)
+})
+
+test('the comment attribute is the shorthand when there is no permalink', () => {
+  const parsed = I.ghInlineRef({ comment: '42', number: '12', repo: 'acme/app' })
+
+  assert.deepEqual({ ...parsed.ref.comment }, { id: 42, kind: 'issue' })
+  // Zero and junk are not ids: the card must not claim a comment it cannot name.
+  assert.equal('comment' in I.ghInlineRef({ comment: '0', number: '12', repo: 'acme/app' }).ref, false)
+  assert.equal('comment' in I.ghInlineRef({ comment: 'abc', number: '12', repo: 'acme/app' }).ref, false)
+})
+
+test('the comment is read out of the thread by id, or not at all', () => {
+  const detail = { comments: [{ id: 6886329479, body: 'first' }, { id: 2, body: 'second' }] }
+
+  assert.equal(I.ghInlineComment(detail, { id: 6886329479 }).body, 'first')
+  assert.equal(I.ghInlineComment(detail, { id: '2' }).body, 'second')
+  // Past the route's 30-object cap, or deleted: no row, and the card says so.
+  assert.equal(I.ghInlineComment(detail, { id: 999 }), null)
+  assert.equal(I.ghInlineComment(null, { id: 2 }), null)
+  assert.equal(I.ghInlineComment(detail, null), null)
+  assert.equal(I.ghInlineComment({ comments: 'nope' }, { id: 2 }), null)
+})
+
+test('a card excerpt is one clean line of the comment', () => {
+  assert.equal(I.ghInlineExcerpt('Ship it.\n\nMore detail here.'), 'Ship it.')
+  assert.equal(I.ghInlineExcerpt('> **quoted** text'), 'quoted text')
+  assert.equal(I.ghInlineExcerpt(''), '')
+  assert.equal(I.ghInlineExcerpt(null), '')
+  assert.equal(I.ghInlineExcerpt('   \n  \n'), '')
+
+  const long = 'x'.repeat(200)
+
+  assert.equal(I.ghInlineExcerpt(long).length, 120)
+  assert.equal(I.ghInlineExcerpt(long).endsWith('…'), true)
+  // A nonsense cap falls back to the default room instead of chopping to nothing.
+  assert.equal(I.ghInlineExcerpt(long, 4).length, 120)
+  assert.equal(I.ghInlineExcerpt('short', 4), 'short')
+})
+
 test('a folder that cannot be read says WHY, never a guessed diagnosis', () => {
   // `/repo` answers refusals with HTTP 200 and a code, so "no payload" is not
   // "this is not a repository". A missing folder reported as "not a git repo"
@@ -338,6 +406,18 @@ test('both modal writes repaint the card that opened them', () => {
   // can reopen nothing, but a comment changes the thread a card's count reads;
   // the state write is the one that flips a card from Open while it says closed.
   assert.equal(invalidations.length, 2, 'comment and state writes must each drop the inline read')
+})
+
+test('a comment card lands the modal ON that comment', () => {
+  const card = source.slice(source.indexOf('function GhInlineCard'), source.indexOf('const GRAPH_COMMIT_LOCK_RE'))
+
+  // The id rides on the stack entry, so Back and forward keep the anchor.
+  assert.match(card, /commentId, kind, number/, 'the entry must carry the comment id')
+  assert.match(card, /focusComment: entry\.commentId \|\| 0/, 'the modal must be told which comment')
+  // The anchor the modal scrolls to, and the outline that says "here".
+  assert.match(source, /id: comment\.id \? `pcc-comment-\$\{comment\.id\}`/, 'a comment needs an anchor id')
+  assert.match(source, /scrollIntoView\(\{ block: 'center' \}\)/, 'the thread must scroll to it')
+  assert.match(source, /\n  ghCommentFlash: \{/, 'the flash style must exist')
 })
 
 test('the inline card code carries no em dash', () => {

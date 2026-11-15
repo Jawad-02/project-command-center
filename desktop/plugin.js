@@ -62,7 +62,7 @@ const ROUTE = '/project-command-center'
 // the Desktop imports a copy from <hermes home>/desktop-plugins/, so a stale copy
 // and a stale tab look identical from the outside. Bump this line on every
 // change worth telling apart in a bug report.
-const PLUGIN_BUILD = 'inline-gh-cards.2026-11-15T0210Z'
+const PLUGIN_BUILD = 'inline-gh-comments.2026-11-15T0330Z'
 // The SDK routes carry no params, so the detail page is its own path and reads
 // the selected project id out of an atom persisted in ctx.storage.
 const PROJECT_ROUTE = `${ROUTE}/project`
@@ -3052,6 +3052,13 @@ const S = {
     borderRadius: 8,
     background: 'color-mix(in srgb, var(--ui-stroke-secondary) 16%, transparent)'
   },
+  // A reference card opened this thread ON this comment: a brief outline says
+  // "here" without moving the reading colour of the comment itself.
+  ghCommentFlash: {
+    outline: '1px solid var(--ui-accent)',
+    outlineOffset: 1,
+    background: 'color-mix(in srgb, var(--ui-accent) 10%, transparent)'
+  },
   ghCommentHead: {
     display: 'flex',
     alignItems: 'center',
@@ -5960,11 +5967,12 @@ function GhLinkSessionMenu({ detail, folder, kind, number, owner, projectId, rep
   })
 }
 
-function GhComment({ comment, decorate, folder, kind, number, refKey }) {
+function GhComment({ comment, decorate, flash, folder, kind, number, refKey }) {
   const at = ageText(comment.created_at)
 
   return jsxs('div', {
-    style: S.ghComment,
+    id: comment.id ? `pcc-comment-${comment.id}` : undefined,
+    style: flash ? { ...S.ghComment, ...S.ghCommentFlash } : S.ghComment,
     children: [
       jsxs('div', {
         style: S.ghCommentHead,
@@ -6104,7 +6112,7 @@ function GhModalMeta({ detail, kind, onOpen }) {
 // The loaded thread. Its own component so the refs query, the composer state and
 // the mutations only exist once there is a detail to talk about — no hook is
 // ever called conditionally.
-function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId, repo }) {
+function GhDetailThread({ detail, focusComment, folder, kind, number, onOpen, owner, projectId, repo }) {
   const comments = Array.isArray(detail.comments) ? detail.comments : []
   const reviews = kind === 'pr' && Array.isArray(detail.reviews) ? detail.reviews : []
   const numbers = useMemo(
@@ -6132,6 +6140,26 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
   const [draft, setDraft] = useState('')
   const [note, setNote] = useState('')
   const [confirming, setConfirming] = useState(false)
+  // A reference card can open the modal ON a comment. Scroll it into view once the
+  // thread has painted and flash it briefly, so the reader lands on the line the
+  // card was quoting instead of at the top of a hundred-comment thread. A comment
+  // past the read's cap has no anchor and nothing scrolls: the card already said
+  // it is not among the fetched comments.
+  const [flash, setFlash] = useState('')
+
+  useEffect(() => {
+    const id = Number(focusComment) || 0
+
+    if (!id) return
+    const anchor = typeof document === 'undefined' ? null : document.getElementById(`pcc-comment-${id}`)
+
+    if (!anchor) return
+    anchor.scrollIntoView({ block: 'center' })
+    setFlash(String(id))
+    const timer = setTimeout(() => setFlash(''), 1800)
+
+    return () => clearTimeout(timer)
+  }, [focusComment, comments.length])
   const closed = String(detail.state || '').toLowerCase() !== 'open'
   const detailKey = [QUERY_ROOT, 'github', kind, folder, number]
   const path = `path=${encodeURIComponent(folder)}`
@@ -6224,7 +6252,11 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
           head('comment', 'Comments', comments.length),
           comments.length > 0
             ? comments.map((comment, i) =>
-                jsx(GhComment, { comment, decorate, folder, kind, number, refKey }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
+                jsx(
+                  GhComment,
+                  { comment, decorate, flash: Boolean(comment.id) && String(comment.id) === flash, folder, kind, number, refKey },
+                  `${comment.id || comment.author || 'c'}-${comment.created_at || i}`
+                )
               )
             : jsx('div', { style: S.ghQuiet, children: 'No comments yet.' })
         ]
@@ -6298,7 +6330,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, projectId
   })
 }
 
-function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, projectId, repo }) {
+function GhDetailModal({ depth, entry, focusComment, folder, onBack, onClose, onOpen, owner, projectId, repo }) {
   const kind = entry.kind === 'pr' ? 'pr' : 'issue'
   const number = Number(entry.number) || 0
   const query = useQuery({
@@ -6391,7 +6423,9 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, p
             : null,
           query.isError && !detail ? jsx('div', { style: S.ghQuiet, children: `Could not load this ${ghKindWord(kind)}.` }) : null,
           failed ? jsx(GhFailure, { data: failed, folder }) : null,
-          detail ? jsx(GhDetailThread, { detail, folder, kind, number, onOpen, owner, projectId, repo }) : null
+          detail
+            ? jsx(GhDetailThread, { detail, focusComment, folder, kind, number, onOpen, owner, projectId, repo })
+            : null
         ]
       })
     ]
@@ -6412,6 +6446,10 @@ const GH_INLINE_DIRECTIVE = 'pcc-gh'
 const GH_INLINE_URL_RE = /^https?:\/\/(?:www\.)?github\.com\/([^/\s?#]+)\/([^/\s?#]+)\/(issues|pull)\/(\d+)/i
 const GH_INLINE_SLUG_RE = /^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9._-]+)$/
 const GH_INLINE_NUMBER_RE = /^\s*#?(\d+)\s*$/
+// The three anchor shapes GitHub mints for a comment permalink. `discussion_r` and
+// `pullrequestreview` belong to review objects, which the thread read does not
+// carry; they still name the pull request, so the card degrades to it and says so.
+const GH_INLINE_ANCHOR_RE = /#(issuecomment|discussion_r|pullrequestreview)-?(\d+)/i
 
 function ghInlineKind(value) {
   const word = String(value || '').trim().toLowerCase()
@@ -6419,6 +6457,18 @@ function ghInlineKind(value) {
   if (word === 'pr' || word === 'pull' || word === 'pull-request' || word === 'pull request') return 'pr'
 
   return 'issue'
+}
+
+// `{ id, kind: 'issue' | 'review' }` from a permalink anchor, or null.
+function ghInlineAnchor(url) {
+  const match = GH_INLINE_ANCHOR_RE.exec(String(url || ''))
+
+  if (!match) return null
+  const id = Number(match[2]) || 0
+
+  if (id <= 0) return null
+
+  return { id, kind: match[1].toLowerCase() === 'issuecomment' ? 'issue' : 'review' }
 }
 
 // `{ ok: true, ref }` or `{ ok: false, reason }`.
@@ -6437,16 +6487,20 @@ function ghInlineRef(attrs) {
 
     if (!match) return { ok: false, reason: 'not_github' }
 
-    return {
-      ok: true,
-      ref: {
-        owner: match[1],
-        repo: match[2].replace(/\.git$/i, ''),
-        kind: match[3].toLowerCase() === 'pull' ? 'pr' : 'issue',
-        number: Number(match[4]) || 0,
-        url
-      }
+    const ref = {
+      owner: match[1],
+      repo: match[2].replace(/\.git$/i, ''),
+      kind: match[3].toLowerCase() === 'pull' ? 'pr' : 'issue',
+      number: Number(match[4]) || 0,
+      url
     }
+    // A permalink that carries a comment anchor names that comment, not the
+    // thread. `#issuecomment-…` is in the thread read; a review anchor is not.
+    const anchor = ghInlineAnchor(url)
+
+    if (anchor) ref.comment = anchor
+
+    return { ok: true, ref }
   }
 
   const number = GH_INLINE_NUMBER_RE.exec(String(raw.number || ''))
@@ -6457,10 +6511,14 @@ function ghInlineRef(attrs) {
   if (!number || Number(number[1]) < 1) return { ok: false, reason: 'no_number' }
   if (!slug) return { ok: false, reason: 'no_repo' }
 
-  return {
-    ok: true,
-    ref: { owner: slug[1], repo: slug[2], kind: ghInlineKind(raw.kind), number: Number(number[1]) || 0, url: '' }
-  }
+  const ref = { owner: slug[1], repo: slug[2], kind: ghInlineKind(raw.kind), number: Number(number[1]) || 0, url: '' }
+  // `comment="123"` is the shorthand for an issue comment when the agent has the
+  // id but not a permalink. A review comment only ever arrives as a permalink.
+  const commentId = Number(String(raw.comment || '')) || 0
+
+  if (commentId > 0) ref.comment = { id: commentId, kind: 'issue' }
+
+  return { ok: true, ref }
 }
 
 function ghInlineKey(ref) {
@@ -6508,6 +6566,38 @@ function ghInlineRow(payload, number) {
 // of having a card. Kicking the reader out to a browser is the worse answer.
 function ghInlineOpenable({ folder, number, sameRepo }) {
   return Boolean(folder && Number(number) > 0 && sameRepo === true)
+}
+
+// The comment row a reference names, out of the thread read. Null when the thread
+// has no such id: the route reads at most 30 objects per item, so a comment past
+// that cap is absent, and a card must say that instead of drawing an empty box.
+function ghInlineComment(detail, comment) {
+  if (!detail || !comment || !comment.id) return null
+  const rows = Array.isArray(detail.comments) ? detail.comments : []
+
+  for (const row of rows) {
+    if (row && Number(row.id) === Number(comment.id)) return row
+  }
+
+  return null
+}
+
+// The first real line of a body, stripped of markdown noise, for a card's one line.
+function ghInlineExcerpt(text, max = 120) {
+  const first = String(text || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean)
+
+  if (!first) return ''
+  const flat = first
+    .replace(/^[>#*+-]+\s*/, '')
+    .replace(/[*_`~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const room = Number(max) > 8 ? Number(max) : 120
+
+  return flat.length > room ? `${flat.slice(0, room - 1).trimEnd()}…` : flat
 }
 
 // One sentence for a folder whose repository could not be read.
@@ -6617,6 +6707,8 @@ function GhInlineCard({ attrs, sessionId, source }) {
       ? repoQuery.data
       : null
   const number = ref ? ref.number : 0
+  const anchor = ref && ref.comment ? ref.comment : null
+  const isComment = Boolean(anchor)
   const sameRepo = ghInlineSameRepo(ref, repo)
   const refsQuery = useQuery({
     enabled: sameRepo,
@@ -6627,6 +6719,20 @@ function GhInlineCard({ attrs, sessionId, source }) {
   })
   const row = sameRepo ? ghInlineRow(refsQuery.data, number) : null
   const kind = row && row.kind ? ghStatusKind(row.kind) : ref && ref.kind ? ref.kind : 'issue'
+  // A comment reference needs the THREAD, which is the only read that carries
+  // comment bodies, and it is the same query key the modal uses: opening the card
+  // after it painted costs no second request. It runs only once the refs read has
+  // settled, because that read is what corrects an `/issues/34` URL whose 34 is
+  // really a pull request.
+  const detailQuery = useQuery({
+    enabled: Boolean(isComment && sameRepo && row && folder),
+    queryFn: () => ghRest(`/github/${kind}/${number}?path=${encodeURIComponent(folder)}`),
+    queryKey: [QUERY_ROOT, 'github', kind, folder, number],
+    retry: false,
+    staleTime: 60000
+  })
+  const detail = detailQuery.data && detailQuery.data.ok !== false ? detailQuery.data : null
+  const commentRow = ghInlineComment(detail, anchor)
   const payload = refsQuery.data || null
   const readFailed = sameRepo && refsQuery.isFetched && (!payload || payload.ok !== true)
   const usable = ghInlineOpenable({ folder, number, sameRepo })
@@ -6635,11 +6741,14 @@ function GhInlineCard({ attrs, sessionId, source }) {
   const entry = stack.length > 0 ? stack[stack.length - 1] : null
   // The click guard asks the same question the button does, not a looser one: a
   // handler that only checked `folder` is how a card for another repository would
-  // open THIS project's item of the same number, with its comment box.
+  // open THIS project's item of the same number, with its comment box. A comment
+  // reference lands on the same modal, scrolled to the comment it named.
   const openItem = useCallback(() => {
     if (!usable) return
-    setStack(prev => (prev.length ? prev : [{ kind, number }]))
-  }, [kind, number, usable])
+    const commentId = anchor && anchor.kind === 'issue' ? anchor.id : 0
+
+    setStack(prev => (prev.length ? prev : [{ commentId, kind, number }]))
+  }, [anchor, kind, number, usable])
 
   // A reference whose attributes cannot be read keeps its own text on screen. A
   // card that silently drew nothing would look like the message never had the
@@ -6659,11 +6768,33 @@ function GhInlineCard({ attrs, sessionId, source }) {
   const look = ghStatusLook(kind, row || {})
   const when = row && row.updated_at ? ageText(row.updated_at) : ''
   const lines = []
+  // A comment card says what the comment says, not what the thread says: the
+  // excerpt is the signal, the state and the author are the context. Its three
+  // honest failures are named below rather than drawn as an empty body.
+  const reviewAnchor = Boolean(anchor && anchor.kind === 'review')
+  const commentLoading = isComment && !detail && !detailQuery.isFetched
+  const commentBody = commentRow ? ghInlineExcerpt(commentRow.body) : ''
+  const commentAuthor = commentRow && commentRow.author ? String(commentRow.author) : ''
+  const commentWhen = commentRow && commentRow.created_at ? ageText(commentRow.created_at) : ''
+  const commentsRead = detail && Number.isFinite(Number(detail.comments_count)) ? Number(detail.comments_count) : 0
 
   if (row) {
-    lines.push(look.label, `${ref.owner}/${ref.repo}`)
-    if (row.author) lines.push(String(row.author))
-    if (when) lines.push(when)
+    if (isComment) {
+      lines.push(look.label)
+      if (reviewAnchor) lines.push('review comments are not in the thread read')
+      else if (commentBody && commentAuthor) lines.push(`comment by ${commentAuthor}`)
+      else if (commentRow) lines.push('comment')
+      else if (commentLoading || !detailQuery.isFetched) lines.push('Reading the thread…')
+      else if (commentRow === null && detail) {
+        lines.push(commentsRead > 0 ? `${commentsRead} comments read, this one is not among them` : 'no comments read')
+      }
+      if (commentWhen) lines.push(commentWhen)
+      else if (row.updated_at) lines.push(ageText(row.updated_at))
+    } else {
+      lines.push(look.label, `${ref.owner}/${ref.repo}`)
+      if (row.author) lines.push(String(row.author))
+      if (when) lines.push(when)
+    }
   } else {
     lines.push(`${ref.owner}/${ref.repo}`)
     if (!folder) lines.push('this chat has no project folder')
@@ -6676,7 +6807,17 @@ function GhInlineCard({ attrs, sessionId, source }) {
     else if (missing) lines.push('no such number in this repository')
   }
 
-  const title = row && row.title ? String(row.title) : loading ? 'Loading…' : missing ? 'No such reference' : ghKindWord(kind)
+  const title = isComment
+    ? reviewAnchor
+      ? 'Review comment'
+      : commentBody || (commentRow ? 'Empty comment' : commentLoading ? 'Reading the thread…' : 'Comment not in this thread')
+    : row && row.title
+      ? String(row.title)
+      : loading
+        ? 'Loading…'
+        : missing
+          ? 'No such reference'
+          : ghKindWord(kind)
 
   return jsxs('span', {
     style: S.ghInlineRoot,
@@ -6687,11 +6828,17 @@ function GhInlineCard({ attrs, sessionId, source }) {
         onClick: usable ? openItem : () => ghOpenExternal(target),
         style: { ...S.ghInlineCard, ...S.ghInlineButton },
         title: usable
-          ? `Open ${ghKindWord(kind)} ${ghNumber(number)} in Project Command Center`
+          ? isComment
+            ? `Open ${ghNumber(number)} in Project Command Center, at this comment`
+            : `Open ${ghKindWord(kind)} ${ghNumber(number)} in Project Command Center`
           : failure || `${target} (opens on GitHub)`,
         type: 'button',
         children: [
-          jsx(Codicon, { name: look.name, size: '0.8125rem', style: { ...S.ghInlineIcon, color: look.color } }),
+          jsx(Codicon, {
+            name: isComment ? 'comment' : look.name,
+            size: '0.8125rem',
+            style: { ...S.ghInlineIcon, color: look.color }
+          }),
           jsxs('span', {
             style: S.ghInlineBody,
             children: [
@@ -6716,6 +6863,7 @@ function GhInlineCard({ attrs, sessionId, source }) {
             {
               depth: stack.length,
               entry,
+              focusComment: entry.commentId || 0,
               folder,
               onBack: () => setStack(prev => prev.slice(0, -1)),
               onClose: () => setStack([]),

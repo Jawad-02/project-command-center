@@ -44,7 +44,7 @@ That is the whole story. It finds the Hermes venv python, runs every suite, and 
 | `graph_layout.test.mjs` | the lane engine, sliced out of the real `desktop/plugin.js` and checked against hand-written cases and real repositories |
 | `github_status.test.mjs` | icon colour, status classification and filter union |
 | `session_lane.test.mjs` | lane resolution: explicit status, PR state, project fallback, nothing |
-| `inline_cards.test.mjs` | the `::pcc-gh` reference parser sliced out of `desktop/plugin.js`, plus the call site: every helper and every `S.ghInline*` key the card uses must exist, and the name the hook tells the model to write must be the name the plugin claims |
+| `inline_cards.test.mjs` | the `::pcc-gh` reference parser (issues, PRs, comment permalinks) sliced out of `desktop/plugin.js`, plus the call site: every helper and every `S.ghInline*` key the card uses must exist, and the name the hook tells the model to write must be the name the plugin claims |
 | `test_hooks.py` | both agent hooks, every positive and negative case, a timing loop |
 | `test_session_status.py` | the link-row lane migration, session scope, project fallback |
 | `test_git_routes.py` | graph and diff routes, including a hostile repository whose config points at a script |
